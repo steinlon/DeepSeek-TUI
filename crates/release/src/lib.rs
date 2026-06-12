@@ -573,6 +573,22 @@ mod tests {
     }
 
     #[test]
+    fn mirror_asset_url_trims_trailing_base_slashes() {
+        for base_url in [
+            "https://example.com/assets",
+            "https://example.com/assets/",
+            "https://example.com/assets//",
+        ] {
+            assert_eq!(
+                mirror_asset_url(base_url, "file.zip"),
+                "https://example.com/assets/file.zip",
+                "{base_url} should join with a single slash"
+            );
+        }
+        assert_eq!(mirror_asset_url("", "file.zip"), "/file.zip");
+    }
+
+    #[test]
     fn resolve_release_query_uses_github_without_overrides() {
         let _env = ReleaseEnvGuard::clear();
 

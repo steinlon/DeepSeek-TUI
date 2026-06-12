@@ -612,6 +612,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_error_permission_denied_displays_reason() {
+        let err = ToolError::permission_denied("unauthorized user");
+
+        assert!(matches!(err, ToolError::PermissionDenied { .. }));
+        assert_eq!(
+            err.to_string(),
+            "Failed to authorize tool execution: unauthorized user"
+        );
+    }
+
+    #[test]
+    fn tool_error_execution_failed_displays_reason() {
+        let err = ToolError::execution_failed("process crashed");
+
+        assert!(
+            matches!(err, ToolError::ExecutionFailed { ref message } if message == "process crashed")
+        );
+        assert_eq!(err.to_string(), "Failed to execute tool: process crashed");
+    }
+
+    #[test]
     fn tool_error_invalid_input_creates_correct_variant() {
         let err = ToolError::invalid_input("test invalid message");
         match err {
@@ -629,6 +650,69 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Failed to resolve path '../outside': path escapes workspace"
+        );
+    }
+
+    #[test]
+    fn tool_call_execution_subject_uses_local_shell_command_and_cwd() {
+        let call = ToolCall {
+            name: "shell".to_string(),
+            payload: ToolPayload::LocalShell {
+                params: codewhale_protocol::LocalShellParams {
+                    command: "ls -l".to_string(),
+                    cwd: Some("/custom/dir".to_string()),
+                    timeout_ms: None,
+                },
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        };
+
+        assert_eq!(
+            call.execution_subject("/fallback/dir"),
+            ("ls -l".to_string(), "/custom/dir".to_string(), "shell")
+        );
+    }
+
+    #[test]
+    fn tool_call_execution_subject_falls_back_for_shell_without_cwd() {
+        let call = ToolCall {
+            name: "shell".to_string(),
+            payload: ToolPayload::LocalShell {
+                params: codewhale_protocol::LocalShellParams {
+                    command: "echo hello".to_string(),
+                    cwd: None,
+                    timeout_ms: None,
+                },
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        };
+
+        assert_eq!(
+            call.execution_subject("/fallback/dir"),
+            (
+                "echo hello".to_string(),
+                "/fallback/dir".to_string(),
+                "shell"
+            )
+        );
+    }
+
+    #[test]
+    fn tool_call_execution_subject_uses_tool_name_for_non_shell_payloads() {
+        let call = ToolCall {
+            name: "my_tool".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        };
+
+        assert_eq!(
+            call.execution_subject("/fallback/dir"),
+            ("my_tool".to_string(), "/fallback/dir".to_string(), "tool")
         );
     }
 }
