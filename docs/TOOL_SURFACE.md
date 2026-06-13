@@ -136,6 +136,13 @@ without losing its source context.
 
 Large logs and command outputs should be artifacts with compact summaries in the transcript. `task_gate_run` handles this automatically for active durable tasks.
 
+Sub-agent runs also expose a compact run receipt through `agent_eval`: `run_id`,
+`follow_up`, `takeover`, `artifacts`, `usage`, `verification`, and
+`worker_record`. Follow-up delivery receipts record whether an `agent_eval`
+message actually reached the child or why it did not. Usage is marked
+`unknown` until worker-level token accounting is available, and verification is
+`self_report_only` unless a separate gate or artifact proves the claim.
+
 ### GitHub context and guarded writes
 
 | Tool | Niche |

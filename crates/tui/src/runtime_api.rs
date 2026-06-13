@@ -55,6 +55,7 @@ use crate::skill_state::SkillStateStore;
 use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
 };
+use crate::tools::subagent::{AgentWorkerRecord, load_persisted_agent_worker_records};
 use codewhale_protocol::fleet::{
     FleetArtifactKind, FleetRun, FleetRunId, FleetWorkerEventPayload, FleetWorkerStatus,
 };
@@ -320,6 +321,11 @@ struct SkillsResponse {
     directories: Vec<PathBuf>,
     warnings: Vec<String>,
     skills: Vec<SkillEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunsResponse {
+    runs: Vec<AgentWorkerRecord>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -590,6 +596,8 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(resume_session_thread),
         )
         .route("/v1/workspace/status", get(workspace_status))
+        .route("/v1/agent-runs", get(list_agent_runs))
+        .route("/v1/agent-runs/{run_id}", get(get_agent_run))
         .route("/v1/fleet/runs", get(list_fleet_runs))
         .route("/v1/fleet/runs/{run_id}", get(get_fleet_run))
         .route(
@@ -1342,6 +1350,36 @@ async fn workspace_status(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<WorkspaceStatusResponse>, ApiError> {
     Ok(Json(collect_workspace_status(&state.workspace)))
+}
+
+async fn list_agent_runs(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<AgentRunsResponse>, ApiError> {
+    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
+        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+    })?;
+    Ok(Json(AgentRunsResponse { runs }))
+}
+
+async fn get_agent_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<AgentWorkerRecord>, ApiError> {
+    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
+        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+    })?;
+    let run = runs
+        .into_iter()
+        .find(|record| {
+            let effective_run_id = if record.spec.run_id.is_empty() {
+                record.spec.worker_id.as_str()
+            } else {
+                record.spec.run_id.as_str()
+            };
+            effective_run_id == run_id || record.spec.worker_id == run_id
+        })
+        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
+    Ok(Json(run))
 }
 
 async fn list_fleet_runs(State(state): State<RuntimeApiState>) -> Result<Json<Value>, ApiError> {
@@ -4025,6 +4063,154 @@ mod tests {
         assert_eq!(stopped["action"], "stop");
         assert_eq!(stopped["stopped"], 1);
         assert_eq!(stopped["status"]["cancelled"], 1);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()> {
+        use crate::tools::subagent::{
+            AgentRunArtifactRef, AgentRunFollowUpTarget, AgentRunTakeoverTarget, AgentRunUsage,
+            AgentRunVerificationSummary, AgentWorkerEvent, AgentWorkerRecord, AgentWorkerSpec,
+            AgentWorkerStatus, AgentWorkerToolProfile, SubAgentType,
+        };
+        use std::collections::VecDeque;
+
+        let root =
+            std::env::temp_dir().join(format!("codewhale-agent-runs-api-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".codewhale/state"))?;
+
+        let record = AgentWorkerRecord {
+            spec: AgentWorkerSpec {
+                worker_id: "agent_receipt".to_string(),
+                run_id: "run_receipt".to_string(),
+                parent_run_id: Some("parent_run".to_string()),
+                session_name: Some("receipt_lane".to_string()),
+                objective: "Verify run receipt projection".to_string(),
+                role: Some("verifier".to_string()),
+                agent_type: SubAgentType::Verifier,
+                model: "deepseek-v4-flash".to_string(),
+                workspace: workspace.clone(),
+                git_branch: Some("codex/v0.8.60".to_string()),
+                context_mode: "fresh".to_string(),
+                fork_context: false,
+                tool_profile: AgentWorkerToolProfile::Explicit(vec!["read_file".to_string()]),
+                max_steps: 4,
+                spawn_depth: 1,
+                max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
+            },
+            actor_kind: "subagent".to_string(),
+            parent_run_id: Some("parent_run".to_string()),
+            follow_up: AgentRunFollowUpTarget {
+                tool: "agent_eval".to_string(),
+                agent_id: "agent_receipt".to_string(),
+                session_name: Some("receipt_lane".to_string()),
+                accepted_statuses: vec![
+                    "running".to_string(),
+                    "interrupted_continuable".to_string(),
+                ],
+                latest_delivery: None,
+            },
+            takeover: AgentRunTakeoverTarget {
+                kind: "local_subagent_session".to_string(),
+                supported: true,
+                agent_id: "agent_receipt".to_string(),
+                session_name: Some("receipt_lane".to_string()),
+                instructions: "Use agent_eval with agent_id 'agent_receipt'.".to_string(),
+                unsupported_reason: None,
+            },
+            artifacts: vec![AgentRunArtifactRef {
+                kind: "transcript".to_string(),
+                name: "transcript_handle".to_string(),
+                target: "agent:agent_receipt".to_string(),
+                description: "Read with handle_read from a live projection.".to_string(),
+            }],
+            usage: AgentRunUsage {
+                status: "unknown".to_string(),
+                total_tokens: None,
+                note: "not reported".to_string(),
+            },
+            verification: AgentRunVerificationSummary {
+                status: "self_report_only".to_string(),
+                summary: "no verified receipt attached".to_string(),
+            },
+            status: AgentWorkerStatus::Completed,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            latest_message: Some("completed".to_string()),
+            result_summary: Some("receipt complete".to_string()),
+            error: None,
+            steps_taken: 2,
+            events: VecDeque::from([AgentWorkerEvent {
+                seq: 1,
+                worker_id: "agent_receipt".to_string(),
+                status: AgentWorkerStatus::Completed,
+                timestamp_ms: 2,
+                message: Some("completed".to_string()),
+                step: Some(2),
+                tool_name: None,
+            }]),
+        };
+        let state_payload = json!({
+            "schema_version": 1,
+            "agents": [],
+            "workers": [record],
+        });
+        fs::write(
+            workspace.join(".codewhale/state/subagents.v1.json"),
+            serde_json::to_vec_pretty(&state_payload)?,
+        )?;
+
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root.clone(),
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let runs: serde_json::Value = client
+            .get(format!("http://{addr}/v1/agent-runs"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(runs["runs"][0]["spec"]["run_id"], "run_receipt");
+        assert_eq!(runs["runs"][0]["follow_up"]["tool"], "agent_eval");
+        assert_eq!(
+            runs["runs"][0]["verification"]["status"],
+            "self_report_only"
+        );
+
+        let run: serde_json::Value = client
+            .get(format!("http://{addr}/v1/agent-runs/run_receipt"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(run["spec"]["worker_id"], "agent_receipt");
+        assert_eq!(run["takeover"]["supported"], true);
+        assert_eq!(run["artifacts"][0]["kind"], "transcript");
+
+        let missing = client
+            .get(format!("http://{addr}/v1/agent-runs/missing"))
+            .send()
+            .await?
+            .status();
+        assert_eq!(missing, StatusCode::NOT_FOUND);
 
         handle.abort();
         Ok(())

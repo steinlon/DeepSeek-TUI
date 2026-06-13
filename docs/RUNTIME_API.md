@@ -495,6 +495,28 @@ Verification:
 npm test --workspace @codewhale/runtime-sdk
 ```
 
+## Agent Run Receipts
+
+Sub-agent lanes persist compact run receipts in
+`.codewhale/state/subagents.v1.json`. The Runtime API exposes those receipts as
+a read-only inspection surface:
+
+| Operation | Endpoint |
+|---|---|
+| List persisted agent runs | `GET /v1/agent-runs` |
+| Inspect one run | `GET /v1/agent-runs/{run_id}` |
+
+The response is the same worker-record shape returned by `agent_eval`:
+`spec.run_id`, `actor_kind`, lifecycle `status`, bounded `events`,
+`follow_up`, `takeover`, `artifacts`, `usage`, and `verification`. `run_id`
+falls back to the worker id for older records, and `{run_id}` may be either the
+run id or the worker id.
+
+These endpoints do not start, cancel, or steer sub-agents. Live follow-up still
+goes through `agent_eval`; live cancellation still goes through `agent_close`.
+The API surface exists so app/editor/headless clients can inspect the same
+handoff receipts that the TUI and parent model see.
+
 ## Session lifecycle (native UI supervision)
 
 | Operation | Endpoint |

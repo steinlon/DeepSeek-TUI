@@ -32,6 +32,9 @@ fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
 fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWorkerSpec {
     AgentWorkerSpec {
         worker_id: worker_id.to_string(),
+        run_id: worker_id.to_string(),
+        parent_run_id: None,
+        session_name: Some(worker_id.to_string()),
         objective: "inspect the repo".to_string(),
         role: Some("explorer".to_string()),
         agent_type: SubAgentType::Explore,
@@ -86,6 +89,8 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
         .get_worker_record("agent_worker_contract")
         .expect("worker record");
     assert_eq!(record.status, AgentWorkerStatus::Completed);
+    assert_eq!(record.spec.run_id, "agent_worker_contract");
+    assert_eq!(record.actor_kind, "subagent");
     assert_eq!(record.spec.agent_type, SubAgentType::Explore);
     assert_eq!(
         record.spec.tool_profile,
@@ -93,6 +98,23 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
     );
     assert_eq!(record.result_summary.as_deref(), Some("worker summary"));
     assert_eq!(record.steps_taken, 1);
+    assert_eq!(record.follow_up.tool, "agent_eval");
+    assert_eq!(record.follow_up.agent_id.as_str(), "agent_worker_contract");
+    assert!(record.takeover.supported);
+    assert!(
+        record
+            .takeover
+            .instructions
+            .contains("agent_eval with agent_id")
+    );
+    assert_eq!(record.usage.status, "unknown");
+    assert_eq!(record.verification.status, "self_report_only");
+    assert!(
+        record
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "transcript")
+    );
     let statuses: Vec<_> = record.events.iter().map(|event| event.status).collect();
     assert!(statuses.contains(&AgentWorkerStatus::Queued));
     assert!(statuses.contains(&AgentWorkerStatus::ModelWait));
@@ -142,6 +164,9 @@ fn headless_worker_records_persist_with_subagent_state() {
     loaded.load_state().expect("load state");
 
     let record = loaded.get_worker_record("agent_persisted").expect("record");
+    assert_eq!(record.spec.run_id, "agent_persisted");
+    assert_eq!(record.follow_up.agent_id, "agent_persisted");
+    assert!(record.takeover.supported);
     assert_eq!(record.status, AgentWorkerStatus::Failed);
     assert_eq!(record.error.as_deref(), Some("boom"));
     assert_eq!(record.steps_taken, 3);
@@ -659,6 +684,12 @@ async fn session_projection_exposes_forked_prefix_cache_contract() {
 
     assert_eq!(projection.name, "fanout_review");
     assert_eq!(projection.context_mode, "forked");
+    assert_eq!(projection.run_id, "agent_test");
+    assert_eq!(projection.follow_up.tool, "agent_eval");
+    assert_eq!(projection.follow_up.agent_id, "agent_test");
+    assert!(projection.takeover.supported);
+    assert_eq!(projection.usage.status, "unknown");
+    assert_eq!(projection.verification.status, "self_report_only");
     assert!(projection.fork_context);
     assert_eq!(projection.prefix_cache.mode, "forked");
     assert_eq!(
@@ -1304,8 +1335,11 @@ async fn test_wait_for_result_reports_timeout_when_still_running() {
         "boot_test".to_string(),
     );
     let agent_id = agent.id.clone();
+    let snapshot = agent.snapshot();
     {
         let mut guard = manager.write().await;
+        guard.register_worker(make_worker_spec(&agent_id, PathBuf::from(".")));
+        guard.complete_worker_from_result(&agent_id, &snapshot);
         guard.agents.insert(agent_id.clone(), agent);
     }
 
@@ -1340,8 +1374,11 @@ async fn agent_eval_on_completed_session_returns_full_projection_not_running_err
     agent.status = SubAgentStatus::Completed;
     agent.result = Some(full_output.clone());
     let agent_id = agent.id.clone();
+    let snapshot = agent.snapshot();
     {
         let mut guard = manager.write().await;
+        guard.register_worker(make_worker_spec(&agent_id, PathBuf::from(".")));
+        guard.complete_worker_from_result(&agent_id, &snapshot);
         guard.agents.insert(agent_id.clone(), agent);
     }
 
@@ -1366,6 +1403,22 @@ async fn agent_eval_on_completed_session_returns_full_projection_not_running_err
     let projection: SubAgentSessionProjection =
         serde_json::from_str(&result.content).expect("projection deserializes");
     assert_eq!(projection.status, "completed");
+    assert_eq!(projection.run_id, "test_agent_2");
+    let worker_record = projection.worker_record.as_ref().expect("worker record");
+    let delivery = worker_record
+        .follow_up
+        .latest_delivery
+        .as_ref()
+        .expect("delivery receipt");
+    assert!(!delivery.delivered);
+    assert_eq!(
+        delivery.reason.as_deref(),
+        Some("session already terminated; follow-up not delivered")
+    );
+    assert_eq!(
+        delivery.message_preview.as_deref(),
+        Some("give me the full per-issue breakdown")
+    );
     assert_eq!(projection.transcript_handle.kind, "var_handle");
     // The full, untruncated child output survives in the snapshot the
     // transcript_handle points at.

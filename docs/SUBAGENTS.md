@@ -228,6 +228,33 @@ Records that loaded from a pre-#405 persisted state file (no
 `session_boot_id` field) classify as prior-session because the
 manager can't match them to the current boot.
 
+## Run receipts, follow-up, and takeover
+
+Each sub-agent has a persisted worker record in
+`.codewhale/state/subagents.v1.json`. The record is the current run-ledger
+slice for sub-agent lanes: it stores `run_id`, objective, role/model,
+workspace/branch, lifecycle events, artifact refs, follow-up target, takeover
+target, usage provenance, and verification provenance.
+
+`agent_eval` returns these fields at the top level of the session projection and
+inside `worker_record`. A running or continuable interrupted child should be
+continued through the returned `follow_up` target (`agent_eval` with the same
+agent id or session name). A local takeover should use the returned `takeover`
+instructions; unsupported future cases must say why instead of leaving the
+operator to guess.
+
+Follow-up delivery is explicit. If a message was delivered, the worker record
+stores a bounded preview and timestamp. If the child had already terminated,
+`agent_eval` still returns the projection and transcript handle, but records the
+undelivered follow-up reason so queued instructions do not disappear into UI
+state.
+
+Artifacts are symbolic refs. Use `handle_read` on the returned
+`transcript_handle` for transcript details, and treat `result_summary` as a
+child self-report unless `verification.status` points to a separate gate or
+receipt. `usage.status` is `unknown` until sub-agent token accounting is wired
+into the worker ledger.
+
 ## Output contract
 
 Every sub-agent produces a final result string with five sections,

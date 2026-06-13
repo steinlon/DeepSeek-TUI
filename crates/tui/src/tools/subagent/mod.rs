@@ -637,6 +637,7 @@ pub enum AgentWorkerStatus {
     Queued,
     Starting,
     Running,
+    WaitingForUser,
     ModelWait,
     RunningTool,
     Completed,
@@ -659,6 +660,12 @@ pub enum AgentWorkerToolProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentWorkerSpec {
     pub worker_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     pub objective: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -673,6 +680,69 @@ pub struct AgentWorkerSpec {
     pub max_steps: u32,
     pub spawn_depth: u32,
     pub max_spawn_depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunFollowUpDelivery {
+    pub delivered: bool,
+    pub timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interrupt: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub continued_from_checkpoint: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunFollowUpTarget {
+    #[serde(default = "default_agent_eval_tool")]
+    pub tool: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub accepted_statuses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_delivery: Option<AgentRunFollowUpDelivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunTakeoverTarget {
+    #[serde(default = "default_subagent_takeover_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub supported: bool,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunArtifactRef {
+    pub kind: String,
+    pub name: String,
+    pub target: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunUsage {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunVerificationSummary {
+    pub status: String,
+    pub summary: String,
 }
 
 /// Structured headless worker event.
@@ -694,6 +764,20 @@ pub struct AgentWorkerEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentWorkerRecord {
     pub spec: AgentWorkerSpec,
+    #[serde(default = "default_subagent_actor_kind")]
+    pub actor_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default = "default_agent_run_follow_up")]
+    pub follow_up: AgentRunFollowUpTarget,
+    #[serde(default = "default_agent_run_takeover")]
+    pub takeover: AgentRunTakeoverTarget,
+    #[serde(default)]
+    pub artifacts: Vec<AgentRunArtifactRef>,
+    #[serde(default = "default_agent_run_usage")]
+    pub usage: AgentRunUsage,
+    #[serde(default = "default_agent_run_verification")]
+    pub verification: AgentRunVerificationSummary,
     pub status: AgentWorkerStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -715,8 +799,19 @@ pub struct AgentWorkerRecord {
 
 impl AgentWorkerRecord {
     fn new(spec: AgentWorkerSpec, now_ms: u64) -> Self {
+        let run_id = agent_worker_run_id(&spec);
+        let artifacts = default_subagent_artifacts(&run_id);
+        let follow_up = follow_up_target_for_spec(&spec);
+        let takeover = takeover_target_for_spec(&spec);
         Self {
+            parent_run_id: spec.parent_run_id.clone(),
             spec,
+            actor_kind: default_subagent_actor_kind(),
+            follow_up,
+            takeover,
+            artifacts,
+            usage: default_agent_run_usage(),
+            verification: default_agent_run_verification(),
             status: AgentWorkerStatus::Starting,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -729,6 +824,162 @@ impl AgentWorkerRecord {
             events: VecDeque::new(),
         }
     }
+}
+
+fn default_subagent_actor_kind() -> String {
+    "subagent".to_string()
+}
+
+fn default_agent_eval_tool() -> String {
+    "agent_eval".to_string()
+}
+
+fn default_subagent_takeover_kind() -> String {
+    "local_subagent_session".to_string()
+}
+
+fn default_agent_run_follow_up() -> AgentRunFollowUpTarget {
+    AgentRunFollowUpTarget {
+        tool: default_agent_eval_tool(),
+        agent_id: String::new(),
+        session_name: None,
+        accepted_statuses: vec!["running".to_string(), "interrupted_continuable".to_string()],
+        latest_delivery: None,
+    }
+}
+
+fn default_agent_run_takeover() -> AgentRunTakeoverTarget {
+    AgentRunTakeoverTarget {
+        kind: default_subagent_takeover_kind(),
+        supported: false,
+        agent_id: String::new(),
+        session_name: None,
+        instructions: "No takeover target is available for this older record.".to_string(),
+        unsupported_reason: Some("legacy_record_missing_agent_id".to_string()),
+    }
+}
+
+fn default_agent_run_usage() -> AgentRunUsage {
+    AgentRunUsage {
+        status: "unknown".to_string(),
+        total_tokens: None,
+        note: "Token usage is not yet reported by the sub-agent worker ledger.".to_string(),
+    }
+}
+
+fn default_agent_run_verification() -> AgentRunVerificationSummary {
+    AgentRunVerificationSummary {
+        status: "self_report_only".to_string(),
+        summary:
+            "No verified command or test receipt is attached; treat the result summary as a child self-report."
+                .to_string(),
+    }
+}
+
+fn agent_worker_run_id(spec: &AgentWorkerSpec) -> String {
+    if spec.run_id.is_empty() {
+        spec.worker_id.clone()
+    } else {
+        spec.run_id.clone()
+    }
+}
+
+fn follow_up_target_for_spec(spec: &AgentWorkerSpec) -> AgentRunFollowUpTarget {
+    AgentRunFollowUpTarget {
+        tool: default_agent_eval_tool(),
+        agent_id: spec.worker_id.clone(),
+        session_name: spec.session_name.clone(),
+        accepted_statuses: vec!["running".to_string(), "interrupted_continuable".to_string()],
+        latest_delivery: None,
+    }
+}
+
+fn takeover_target_for_spec(spec: &AgentWorkerSpec) -> AgentRunTakeoverTarget {
+    let agent_ref = spec
+        .session_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&spec.worker_id);
+    AgentRunTakeoverTarget {
+        kind: default_subagent_takeover_kind(),
+        supported: true,
+        agent_id: spec.worker_id.clone(),
+        session_name: spec.session_name.clone(),
+        instructions: format!(
+            "Use agent_eval with agent_id '{agent_ref}' to inspect or send follow-up input; use agent_close to cancel the lane."
+        ),
+        unsupported_reason: None,
+    }
+}
+
+fn default_subagent_artifacts(run_id: &str) -> Vec<AgentRunArtifactRef> {
+    vec![
+        AgentRunArtifactRef {
+            kind: "worker_events".to_string(),
+            name: "worker_record.events".to_string(),
+            target: run_id.to_string(),
+            description: "Bounded structured lifecycle events retained on the worker record."
+                .to_string(),
+        },
+        AgentRunArtifactRef {
+            kind: "transcript".to_string(),
+            name: "transcript_handle".to_string(),
+            target: format!("agent:{run_id}"),
+            description:
+                "Use the projection transcript_handle with handle_read for the child transcript."
+                    .to_string(),
+        },
+        AgentRunArtifactRef {
+            kind: "receipt".to_string(),
+            name: "result_summary".to_string(),
+            target: run_id.to_string(),
+            description: "Child final summary when present; verify before treating as fact."
+                .to_string(),
+        },
+    ]
+}
+
+fn message_preview(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let mut preview: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
+    if text.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn normalize_worker_spec(mut spec: AgentWorkerSpec) -> AgentWorkerSpec {
+    if spec.run_id.is_empty() {
+        spec.run_id = spec.worker_id.clone();
+    }
+    spec
+}
+
+fn normalize_worker_record(mut record: AgentWorkerRecord) -> AgentWorkerRecord {
+    record.spec = normalize_worker_spec(record.spec);
+    let run_id = agent_worker_run_id(&record.spec);
+    if record.actor_kind.is_empty() {
+        record.actor_kind = default_subagent_actor_kind();
+    }
+    if record.parent_run_id.is_none() {
+        record.parent_run_id = record.spec.parent_run_id.clone();
+    }
+    if record.follow_up.agent_id.is_empty() {
+        record.follow_up = follow_up_target_for_spec(&record.spec);
+    }
+    if record.takeover.agent_id.is_empty() {
+        record.takeover = takeover_target_for_spec(&record.spec);
+    }
+    if record.artifacts.is_empty() {
+        record.artifacts = default_subagent_artifacts(&run_id);
+    }
+    if record.usage.status.is_empty() {
+        record.usage = default_agent_run_usage();
+    }
+    if record.verification.status.is_empty() {
+        record.verification = default_agent_run_verification();
+    }
+    record
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1502,6 +1753,7 @@ impl SubAgentManager {
             self.agents.insert(persisted.id, agent);
         }
         for worker in state.workers {
+            let worker = normalize_worker_record(worker);
             self.worker_event_seq = self.worker_event_seq.max(
                 worker
                     .events
@@ -1545,7 +1797,7 @@ impl SubAgentManager {
     fn register_worker(&mut self, spec: AgentWorkerSpec) {
         let worker_id = spec.worker_id.clone();
         let now_ms = epoch_millis_now();
-        let mut record = AgentWorkerRecord::new(spec, now_ms);
+        let mut record = AgentWorkerRecord::new(normalize_worker_spec(spec), now_ms);
         self.push_worker_event(
             &mut record,
             AgentWorkerStatus::Starting,
@@ -1634,7 +1886,7 @@ impl SubAgentManager {
     }
 
     fn complete_worker_from_result(&mut self, worker_id: &str, result: &SubAgentResult) {
-        let status = worker_status_from_subagent_status(&result.status);
+        let status = worker_status_from_subagent_result(result);
         let message = match &result.status {
             SubAgentStatus::Completed => Some("completed".to_string()),
             SubAgentStatus::Failed(err) => Some(err.clone()),
@@ -1649,6 +1901,33 @@ impl SubAgentManager {
             if let SubAgentStatus::Failed(err) = &result.status {
                 record.error = Some(err.clone());
             }
+        }
+    }
+
+    fn record_follow_up_delivery(
+        &mut self,
+        worker_id: &str,
+        delivered: bool,
+        message: Option<&str>,
+        reason: Option<&str>,
+        interrupt: bool,
+        continued_from_checkpoint: bool,
+    ) {
+        let Some(record) = self.worker_records.get_mut(worker_id) else {
+            return;
+        };
+        let now_ms = epoch_millis_now();
+        record.updated_at_ms = now_ms;
+        record.follow_up.latest_delivery = Some(AgentRunFollowUpDelivery {
+            delivered,
+            timestamp_ms: now_ms,
+            message_preview: message.map(message_preview),
+            reason: reason.map(str::to_string),
+            interrupt,
+            continued_from_checkpoint,
+        });
+        if delivered {
+            record.latest_message = Some("follow-up delivered via agent_eval".to_string());
         }
     }
 
@@ -1830,6 +2109,9 @@ impl SubAgentManager {
         let max_steps = self.max_steps;
         let worker_spec = AgentWorkerSpec {
             worker_id: agent_id.clone(),
+            run_id: agent_id.clone(),
+            parent_run_id: None,
+            session_name: Some(agent.session_name.clone()),
             objective: assignment.objective.clone(),
             role: assignment.role.clone(),
             agent_type: agent_type.clone(),
@@ -2400,17 +2682,36 @@ impl SubAgentManager {
 /// Thread-safe wrapper for `SubAgentManager`.
 pub type SharedSubAgentManager = Arc<RwLock<SubAgentManager>>;
 
+pub fn load_persisted_agent_worker_records(workspace: &Path) -> Result<Vec<AgentWorkerRecord>> {
+    let mut manager = SubAgentManager::new(workspace.to_path_buf(), 1)
+        .with_state_path(default_state_path(workspace));
+    manager.load_state()?;
+    Ok(manager.list_worker_records())
+}
+
 /// Model-facing session projection returned by the v0.8.33 sub-agent API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentSessionProjection {
     pub name: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub run_id: String,
     pub status: String,
     pub terminal: bool,
     pub context_mode: String,
     pub fork_context: bool,
     pub prefix_cache: SubAgentPrefixCacheProjection,
     pub transcript_handle: VarHandle,
+    #[serde(default = "default_agent_run_follow_up")]
+    pub follow_up: AgentRunFollowUpTarget,
+    #[serde(default = "default_agent_run_takeover")]
+    pub takeover: AgentRunTakeoverTarget,
+    #[serde(default)]
+    pub artifacts: Vec<AgentRunArtifactRef>,
+    #[serde(default = "default_agent_run_usage")]
+    pub usage: AgentRunUsage,
+    #[serde(default = "default_agent_run_verification")]
+    pub verification: AgentRunVerificationSummary,
     pub snapshot: SubAgentResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<SubAgentCheckpoint>,
@@ -2493,16 +2794,62 @@ async fn subagent_session_projection(
             store.insert_json(transcript_session_id, "transcript", transcript_payload)
         }
     };
+    let run_id = worker_record
+        .as_ref()
+        .map(|record| agent_worker_run_id(&record.spec))
+        .unwrap_or_else(|| snapshot.agent_id.clone());
+    let follow_up = worker_record
+        .as_ref()
+        .map(|record| record.follow_up.clone())
+        .unwrap_or_else(|| AgentRunFollowUpTarget {
+            tool: default_agent_eval_tool(),
+            agent_id: snapshot.agent_id.clone(),
+            session_name: Some(snapshot.name.clone()),
+            accepted_statuses: vec!["running".to_string(), "interrupted_continuable".to_string()],
+            latest_delivery: None,
+        });
+    let takeover = worker_record
+        .as_ref()
+        .map(|record| record.takeover.clone())
+        .unwrap_or_else(|| AgentRunTakeoverTarget {
+            kind: default_subagent_takeover_kind(),
+            supported: true,
+            agent_id: snapshot.agent_id.clone(),
+            session_name: Some(snapshot.name.clone()),
+            instructions: format!(
+                "Use agent_eval with agent_id '{}' to inspect or send follow-up input; use agent_close to cancel the lane.",
+                snapshot.agent_id
+            ),
+            unsupported_reason: None,
+        });
+    let artifacts = worker_record
+        .as_ref()
+        .map(|record| record.artifacts.clone())
+        .unwrap_or_else(|| default_subagent_artifacts(&run_id));
+    let usage = worker_record
+        .as_ref()
+        .map(|record| record.usage.clone())
+        .unwrap_or_else(default_agent_run_usage);
+    let verification = worker_record
+        .as_ref()
+        .map(|record| record.verification.clone())
+        .unwrap_or_else(default_agent_run_verification);
 
     SubAgentSessionProjection {
         name: snapshot.name.clone(),
         agent_id: snapshot.agent_id.clone(),
+        run_id,
         status: subagent_status_name(&snapshot.status).to_string(),
         terminal: snapshot.status != SubAgentStatus::Running,
         context_mode: snapshot.context_mode.clone(),
         fork_context: snapshot.fork_context,
         prefix_cache: subagent_prefix_cache_projection(&snapshot),
         transcript_handle,
+        follow_up,
+        takeover,
+        artifacts,
+        usage,
+        verification,
         checkpoint: snapshot.checkpoint.clone(),
         continuable: subagent_checkpoint_is_continuable(&snapshot),
         snapshot,
@@ -3266,10 +3613,20 @@ impl ToolSpec for AgentEvalTool {
         // child output".
         let mut message_delivery: Option<Value> = None;
         if continue_from_checkpoint {
+            let delivery_preview = message.clone();
             let mut manager = self.manager.write().await;
             manager
                 .continue_checkpointed(&agent_id, message, interrupt)
                 .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+            manager.record_follow_up_delivery(
+                &agent_id,
+                true,
+                delivery_preview.as_deref(),
+                None,
+                interrupt,
+                true,
+            );
+            manager.persist_state_best_effort();
             message_delivery = Some(json!({
                 "delivered": true,
                 "continued_from_checkpoint": true
@@ -3283,16 +3640,36 @@ impl ToolSpec for AgentEvalTool {
                     .unwrap_or(false)
             };
             if terminal {
+                let reason = "session already terminated; follow-up not delivered";
+                let mut manager = self.manager.write().await;
+                manager.record_follow_up_delivery(
+                    &agent_id,
+                    false,
+                    Some(message.as_str()),
+                    Some(reason),
+                    interrupt,
+                    false,
+                );
+                manager.persist_state_best_effort();
                 message_delivery = Some(json!({
                     "delivered": false,
-                    "reason": "session already terminated; follow-up not delivered",
+                    "reason": reason,
                     "recover_full_output": "read the returned transcript_handle with handle_read"
                 }));
             } else {
                 let mut manager = self.manager.write().await;
                 manager
-                    .send_input(&agent_id, message, interrupt)
+                    .send_input(&agent_id, message.clone(), interrupt)
                     .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+                manager.record_follow_up_delivery(
+                    &agent_id,
+                    true,
+                    Some(message.as_str()),
+                    None,
+                    interrupt,
+                    false,
+                );
+                manager.persist_state_best_effort();
                 message_delivery = Some(json!({ "delivered": true }));
             }
         }
@@ -6005,11 +6382,21 @@ fn worker_status_from_subagent_status(status: &SubAgentStatus) -> AgentWorkerSta
     }
 }
 
+fn worker_status_from_subagent_result(result: &SubAgentResult) -> AgentWorkerStatus {
+    if subagent_checkpoint_is_continuable(result) {
+        AgentWorkerStatus::WaitingForUser
+    } else {
+        worker_status_from_subagent_status(&result.status)
+    }
+}
+
 fn worker_progress_event_parts(message: &str) -> (AgentWorkerStatus, Option<u32>, Option<String>) {
     let step = parse_progress_step(message);
     let lower = message.to_ascii_lowercase();
     let status = if lower.contains("queued") {
         AgentWorkerStatus::Queued
+    } else if lower.contains("waiting for user") || lower.contains("waiting for follow-up") {
+        AgentWorkerStatus::WaitingForUser
     } else if lower.contains("requesting model response")
         || lower.contains(SUBAGENT_MODEL_WAIT_REASON)
     {
