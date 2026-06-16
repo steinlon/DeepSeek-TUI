@@ -8481,6 +8481,10 @@ api_key = "old-openrouter-key"
 
     #[test]
     fn deepseek_default_model_canonicalizes_provider_prefixed_ids() {
+        let _lock = lock_test_env();
+        let temp_root = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::new(temp_root.path());
+
         let config = Config {
             provider: Some("deepseek".to_string()),
             default_text_model: Some(DEFAULT_OPENROUTER_MODEL.to_string()),
