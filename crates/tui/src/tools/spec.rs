@@ -925,6 +925,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_tool_context_default_mode_rejects_nonexistent_path_under_workspace_symlink() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+        std::fs::create_dir_all(outside.join("target")).expect("mkdir outside target");
+        symlink(outside.join("target"), workspace.join("linked")).expect("symlink");
+
+        let ctx = ToolContext::new(workspace);
+        let err = ctx
+            .resolve_path("linked/new.txt")
+            .expect_err("default mode should still reject workspace symlink escapes");
+
+        assert!(matches!(err, ToolError::PathEscape { .. }));
+    }
+
+    #[test]
     fn test_required_str() {
         let input = json!({"name": "test", "count": 42});
         assert_eq!(required_str(&input, "name").unwrap(), "test");

@@ -785,6 +785,32 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn test_grep_files_default_mode_skips_symlinked_directories_but_keeps_real_files() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let real_dir = workspace.join("real");
+        std::fs::create_dir_all(&real_dir).expect("mkdir workspace");
+        fs::write(real_dir.join("needle.txt"), "NEEDLE\n").expect("write real file");
+        std::os::unix::fs::symlink(&workspace, real_dir.join("loop")).expect("symlink loop");
+
+        let ctx = ToolContext::new(workspace);
+        let tool = GrepFilesTool;
+        let result = tool
+            .execute(json!({"pattern": "NEEDLE"}), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        let parsed: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["total_matches"].as_u64().unwrap(), 1);
+        assert_eq!(parsed["files_searched"].as_u64().unwrap(), 1);
+        let matches = parsed["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0]["file"].as_str().unwrap().ends_with("real/needle.txt"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn test_grep_files_follow_symlinks_avoids_directory_cycles() {
         let tmp = tempdir().expect("tempdir");
         let workspace = tmp.path().join("workspace");
