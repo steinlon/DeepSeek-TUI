@@ -27,12 +27,12 @@ const TOOL_TEXT_LIMIT: usize = 300;
 const TOOL_HEADER_SUMMARY_LIMIT: usize = 56;
 const TOOL_OUTPUT_HEAD_LINES: usize = 2;
 const TOOL_OUTPUT_TAIL_LINES: usize = 2;
-const TOOL_RUNNING_SYMBOLS: [&str; 4] = ["·", "◦", "•", "◦"];
-// Spinner cadence per glyph. The status-animation tick (UI_STATUS_ANIMATION_MS
-// = 360 ms) fires every two glyphs, so a full 4-glyph "heartbeat" lands in
-// ~2.88 s — fast enough that the user sees motion within a few hundred ms of
-// starting a tool, slow enough to read as a pulse rather than a strobe.
-const TOOL_STATUS_SYMBOL_MS: u64 = 720;
+const TOOL_RUNNING_SYMBOLS: [&str; 10] = [
+    "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280F}",
+];
+/// Per-glyph cadence: 200 ms — fast enough to feel alive, slow enough to read.
+const TOOL_STATUS_SYMBOL_MS: u64 = 200;
 /// Visual marker for the user role at the start of their message line. Solid
 /// vertical bar — no animation; user input is a finished thing.
 const USER_GLYPH: &str = "\u{258E}"; // ▎
