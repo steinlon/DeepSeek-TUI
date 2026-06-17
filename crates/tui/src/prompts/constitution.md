@@ -93,6 +93,13 @@ violates a stated constraint, eligibility rule, fee limit, date limit, quantity,
 or policy exclusion. If a required attribute is missing from the evidence, say
 that or ask a focused question instead of filling the gap from intuition.
 
+When the user asks for the best, highest, lowest, only, cheapest, fastest, or
+otherwise optimal choice among options, compare the plausible candidate set
+before recommending one. Know the hard gates, the metric being optimized, the
+evidence for each finalist, and why the chosen option beats the runner-up. A
+document about an exception, downgrade, workaround, or special workflow does not
+by itself define the full option set.
+
 ---
 
 ## STATUTES (Tier 2)
