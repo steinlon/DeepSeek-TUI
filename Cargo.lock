@@ -910,8 +910,10 @@ dependencies = [
 name = "codewhale-protocol"
 version = "0.8.62"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
