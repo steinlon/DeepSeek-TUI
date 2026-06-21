@@ -439,7 +439,6 @@ pub enum MessageId {
     KbJumpPlanAgentYolo,
     KbAltJumpPlanAgentYolo,
     KbFocusSidebar,
-    KbTogglePlanAgent,
     KbSessionPicker,
     KbPasteAttach,
     KbCopySelection,
@@ -883,7 +882,6 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbJumpPlanAgentYolo,
     MessageId::KbAltJumpPlanAgentYolo,
     MessageId::KbFocusSidebar,
-    MessageId::KbTogglePlanAgent,
     MessageId::KbSessionPicker,
     MessageId::KbPasteAttach,
     MessageId::KbCopySelection,
@@ -1597,7 +1595,6 @@ fn english(id: MessageId) -> &'static str {
         MessageId::KbFocusSidebar => {
             "Focus Pinned / Tasks / Agents / Context / Auto sidebar; Ctrl+Alt+0 toggles pinned sidebar"
         }
-        MessageId::KbTogglePlanAgent => "Toggle between Plan and Agent modes",
         MessageId::KbSessionPicker => "Open the session picker",
         MessageId::KbPasteAttach => "Paste text or attach a clipboard image",
         MessageId::KbCopySelection => "Copy the current selection (Cmd+C on macOS)",
@@ -1643,7 +1640,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::HomeQuickHelp => "/help        - Show help",
         MessageId::HomeModeTips => "Mode Tips",
         MessageId::HomeAgentModeTip => "Agent mode - Use tools for autonomous tasks",
-        MessageId::HomeAgentModeReviewTip => "  Use Ctrl+X to review in Plan mode before executing",
+        MessageId::HomeAgentModeReviewTip => "  Type /mode plan to review before executing",
         MessageId::HomeAgentModeYoloTip => "  Type /mode yolo to enable full tool access",
         MessageId::HomeYoloModeTip => "YOLO mode - Full tool access, no approvals",
         MessageId::HomeYoloModeCaution => "  Be careful with destructive operations!",
@@ -2231,7 +2228,6 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::KbFocusSidebar => {
             "Focus vào thanh bên Pinned / Tasks / Agents / Context / Auto; Ctrl+Alt+0 để ẩn"
         }
-        MessageId::KbTogglePlanAgent => "Chuyển đổi giữa chế độ Plan và Agent",
         MessageId::KbSessionPicker => "Mở bảng chọn phiên làm việc",
         MessageId::KbPasteAttach => "Dán văn bản hoặc đính kèm hình ảnh từ bộ nhớ tạm",
         MessageId::KbCopySelection => "Sao chép vùng chọn hiện tại (Cmd+C trên macOS)",
@@ -2277,9 +2273,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::HomeQuickHelp => "/help        - Hiển thị trợ giúp",
         MessageId::HomeModeTips => "Mẹo về Chế độ",
         MessageId::HomeAgentModeTip => "Chế độ Agent - Sử dụng công cụ cho các nhiệm vụ tự chủ",
-        MessageId::HomeAgentModeReviewTip => {
-            "  Sử dụng Ctrl+X để xem xét ở chế độ Plan trước khi thực thi"
-        }
+        MessageId::HomeAgentModeReviewTip => "  Nhập /mode plan để xem xét trước khi thực thi",
         MessageId::HomeAgentModeYoloTip => "  Nhập /mode yolo để bật toàn quyền truy cập công cụ",
         MessageId::HomeYoloModeTip => {
             "Chế độ YOLO - Toàn quyền truy cập công cụ, không cần phê duyệt"
@@ -3022,7 +3016,6 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::KbFocusSidebar => {
             "Pinned / Tasks / Agents / Context / Auto / Hidden サイドバーにフォーカス"
         }
-        MessageId::KbTogglePlanAgent => "Plan モードと Agent モードを切り替え",
         MessageId::KbSessionPicker => "セッションピッカーを開く",
         MessageId::KbPasteAttach => "テキストを貼り付けまたはクリップボード画像を添付",
         MessageId::KbCopySelection => "現在の選択をコピー（macOS は Cmd+C）",
@@ -3070,7 +3063,7 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::HomeQuickHelp => "/help        - ヘルプを表示",
         MessageId::HomeModeTips => "モードヒント",
         MessageId::HomeAgentModeTip => "Agent モード - ツールを使って自律的なタスクを実行",
-        MessageId::HomeAgentModeReviewTip => "  実行前に Ctrl+X で Plan モードでレビュー",
+        MessageId::HomeAgentModeReviewTip => "  実行前のレビューには /mode plan を入力",
         MessageId::HomeAgentModeYoloTip => "  /mode yolo と入力して完全なツールアクセスを有効化",
         MessageId::HomeYoloModeTip => "YOLO モード - 完全なツールアクセス、承認なし",
         MessageId::HomeYoloModeCaution => "  破壊的な操作には注意してください！",
@@ -3582,7 +3575,6 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::KbJumpPlanAgentYolo => "触发快捷栏槽位",
         MessageId::KbAltJumpPlanAgentYolo => "替代快捷键跳转到 Plan / Agent / YOLO 模式",
         MessageId::KbFocusSidebar => "聚焦 Pinned / 任务 / 代理 / Context / 自动 / 隐藏侧边栏",
-        MessageId::KbTogglePlanAgent => "在 Plan 和 Agent 模式之间切换",
         MessageId::KbSessionPicker => "打开会话选择器",
         MessageId::KbPasteAttach => "粘贴文本或附加剪贴板图片",
         MessageId::KbCopySelection => "复制当前选中内容（macOS 为 Cmd+C）",
@@ -3626,7 +3618,7 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::HomeQuickHelp => "/help        - 显示帮助",
         MessageId::HomeModeTips => "模式提示",
         MessageId::HomeAgentModeTip => "Agent 模式 - 使用工具执行自主任务",
-        MessageId::HomeAgentModeReviewTip => "  按 Ctrl+X 可在 Plan 模式下审查后再执行",
+        MessageId::HomeAgentModeReviewTip => "  输入 /mode plan 可在执行前审查",
         MessageId::HomeAgentModeYoloTip => "  输入 /mode yolo 启用完整工具访问",
         MessageId::HomeYoloModeTip => "YOLO 模式 - 完整工具访问，无需审批",
         MessageId::HomeYoloModeCaution => "  请小心破坏性操作！",
@@ -4170,7 +4162,6 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::KbFocusSidebar => {
             "Focar barra lateral Pinned / Tasks / Agents / Context / Auto / Ocultar"
         }
-        MessageId::KbTogglePlanAgent => "Alternar entre modos Plan e Agent",
         MessageId::KbSessionPicker => "Abrir seletor de sessões",
         MessageId::KbPasteAttach => "Colar texto ou anexar imagem da área de transferência",
         MessageId::KbCopySelection => "Copiar seleção atual (Cmd+C no macOS)",
@@ -4216,9 +4207,7 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::HomeQuickHelp => "/help        - Exibir ajuda",
         MessageId::HomeModeTips => "Dicas de Modo",
         MessageId::HomeAgentModeTip => "Modo Agent - Use ferramentas para tarefas autônomas",
-        MessageId::HomeAgentModeReviewTip => {
-            "  Use Ctrl+X para revisar no modo Plan antes de executar"
-        }
+        MessageId::HomeAgentModeReviewTip => "  Digite /mode plan para revisar antes de executar",
         MessageId::HomeAgentModeYoloTip => {
             "  Digite /mode yolo para habilitar acesso total às ferramentas"
         }
@@ -4806,7 +4795,6 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::KbFocusSidebar => {
             "Enfocar barra lateral Pinned / Tasks / Agents / Context / Auto / Ocultar"
         }
-        MessageId::KbTogglePlanAgent => "Alternar entre modos Plan y Agent",
         MessageId::KbSessionPicker => "Abrir selector de sesiones",
         MessageId::KbPasteAttach => "Pegar texto o adjuntar imagen del portapapeles",
         MessageId::KbCopySelection => "Copiar selección actual (Cmd+C en macOS)",
@@ -4854,9 +4842,7 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::HomeQuickHelp => "/help        - Mostrar ayuda",
         MessageId::HomeModeTips => "Tips de Modo",
         MessageId::HomeAgentModeTip => "Modo Agent - Usar herramientas para tareas autónomas",
-        MessageId::HomeAgentModeReviewTip => {
-            "  Usa Ctrl+X para revisar en modo Plan antes de ejecutar"
-        }
+        MessageId::HomeAgentModeReviewTip => "  Escribe /mode plan para revisar antes de ejecutar",
         MessageId::HomeAgentModeYoloTip => {
             "  Escribe /mode yolo para habilitar acceso total a las herramientas"
         }

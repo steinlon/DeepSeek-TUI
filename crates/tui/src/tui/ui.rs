@@ -4844,13 +4844,6 @@ async fn run_event_loop(
                         } else {
                             app.push_status_toast("Cut failed", StatusToastLevel::Error, None);
                         }
-                    } else {
-                        let new_mode = match app.mode {
-                            AppMode::Plan => AppMode::Agent,
-                            AppMode::Agent => AppMode::Yolo,
-                            AppMode::Yolo => AppMode::Plan,
-                        };
-                        apply_mode_update(app, &engine_handle, new_mode).await;
                     }
                 }
                 _ if key_shortcuts::is_paste_shortcut(&key) => {

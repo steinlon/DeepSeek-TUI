@@ -256,11 +256,6 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         description_id: crate::localization::MessageId::KbFocusSidebar,
         section: KeybindingSection::Modes,
     },
-    KeybindingEntry {
-        chord: "Ctrl+X",
-        description_id: crate::localization::MessageId::KbTogglePlanAgent,
-        section: KeybindingSection::Modes,
-    },
     // --- Sessions ---
     KeybindingEntry {
         chord: "Ctrl+R",

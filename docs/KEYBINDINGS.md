@@ -10,7 +10,6 @@ Bindings are not (yet) user-configurable — tracked for a future release (#436,
 |----------------------|---------------------------------------------------------------|
 | `F1` or `Ctrl-/`     | Toggle the help overlay                                       |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
-| `Ctrl-X`             | Cancel all running background shell jobs when the Tasks sidebar is focused |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
 | `Ctrl-B`             | Background the running foreground shell command (turn continues; the command becomes a `/jobs` background job) |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
@@ -78,6 +77,7 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 | `↑` / `↓` / `j` / `k`| Move selection                                     |
 | `Enter`              | Activate the selected item (open / focus / cancel) |
 | `Tab`                | Cycle to next sidebar panel (Work → Tasks → Agents → Context) |
+| `Ctrl-X`             | Cancel all running background shell jobs when the Tasks panel is focused |
 | `Esc`                | Return focus to composer                           |
 
 ## Slash-command palette (after `Ctrl-K` or typing `/`)
