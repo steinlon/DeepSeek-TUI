@@ -2902,7 +2902,8 @@ impl ConfigStore {
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+        let path = normalize_config_file_path(self.path.clone())?;
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create config directory {}", parent.display())
             })?;
@@ -2917,12 +2918,12 @@ impl ConfigStore {
         } else {
             toml::to_string_pretty(&self.config).context("failed to serialize config")?
         };
-        if checked_path_exists(&self.path)? {
-            let existing = read_checked_config_file(&self.path)?;
+        if checked_path_exists(&path)? {
+            let existing = read_checked_config_file(&path)?;
             if existing == body {
                 return Ok(());
             }
-            write_one_time_config_backup(&self.path)?;
+            write_one_time_config_backup(&path)?;
         }
         #[cfg(unix)]
         {
@@ -2931,22 +2932,19 @@ impl ConfigStore {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&self.path)
-                .with_context(|| format!("failed to write config at {}", self.path.display()))?;
+                .open(&path)
+                .with_context(|| format!("failed to write config at {}", path.display()))?;
             file.write_all(body.as_bytes())
-                .with_context(|| format!("failed to write config at {}", self.path.display()))?;
+                .with_context(|| format!("failed to write config at {}", path.display()))?;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .with_context(|| {
-                    format!(
-                        "failed to set config permissions at {}",
-                        self.path.display()
-                    )
+                    format!("failed to set config permissions at {}", path.display())
                 })?;
         }
         #[cfg(not(unix))]
         {
-            fs::write(&self.path, body)
-                .with_context(|| format!("failed to write config at {}", self.path.display()))?;
+            fs::write(&path, body)
+                .with_context(|| format!("failed to write config at {}", path.display()))?;
         }
         Ok(())
     }

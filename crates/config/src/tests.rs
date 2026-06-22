@@ -2119,6 +2119,34 @@ fn normalize_config_file_path_rejects_traversal() {
 }
 
 #[test]
+fn config_store_save_revalidates_path_before_parent_creation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside_dir = dir.path().join("outside");
+    let traversal_path = dir
+        .path()
+        .join("allowed")
+        .join("..")
+        .join("outside")
+        .join(CONFIG_FILE_NAME);
+    let store = ConfigStore {
+        path: traversal_path,
+        config: ConfigToml::default(),
+        permissions: PermissionsToml::default(),
+        original_raw: None,
+    };
+
+    let err = store
+        .save()
+        .expect_err("save should reject traversal before creating parents");
+
+    assert!(format!("{err:#}").contains("cannot contain '..'"));
+    assert!(
+        !outside_dir.exists(),
+        "save must not create directories from an unvalidated path"
+    );
+}
+
+#[test]
 fn resolve_config_path_rejects_env_traversal() {
     let _lock = env_lock();
     struct ConfigPathEnvGuard {
