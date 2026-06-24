@@ -1,12 +1,29 @@
 # v0.8.65 Remaining Agent Prompt
 
 Use this prompt for the next agent that picks up the v0.8.65 finish work.
+This is the canonical v0.8.65 remaining-work handoff.
 
 ```text
 You are working in Hmbown/CodeWhale. Read AGENTS.md first, then confirm the
 current branch with `git branch --show-current` before editing. The source of
 truth is the live GitHub milestone and the issue/PR comments, not historical
 triage notes.
+
+Start clean:
+
+- Do not implement from `codex/v0.8.65-ledger-truth`, #3493's docs branch, or
+  any dirty handoff branch.
+- Fetch live state, then create a fresh implementation branch/worktree from
+  `origin/main`, for example:
+  `git fetch origin`
+  `git worktree add ../.cw-worktrees/v0865-remaining-mcp -b codex/v0865-remaining-mcp origin/main`
+- If you stay in an existing checkout instead, run
+  `git switch -c codex/v0865-remaining-<topic> origin/main`.
+- Before editing, `git status -sb` must be clean. If it is not clean, inspect
+  the changes and do not stage or overwrite unrelated work.
+- After creating the branch/worktree, refresh live scope with
+  `gh issue list --repo Hmbown/CodeWhale --milestone v0.8.65 --state open` and
+  `gh pr list --repo Hmbown/CodeWhale --state open`.
 
 Goal: finish the remaining v0.8.65 milestone issues and get them merged or
 clearly resolved:
