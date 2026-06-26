@@ -258,6 +258,12 @@ impl ApprovalRequest {
             .into_iter()
             .map(|mut detail| {
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
+                if let Some(lines) = detail.shell_lines.as_mut() {
+                    for line in lines.iter_mut() {
+                        *line = localize_detail_label(line, locale).to_string();
+                    }
+                    detail.value = lines.join("\n");
+                }
                 detail
             })
             .collect()
@@ -712,7 +718,26 @@ fn prefixed_preview_lines(
     lines
 }
 
+fn push_preview_line(lines: &mut Vec<String>, line: impl Into<String>, limit: usize) -> bool {
+    if lines.len() >= limit {
+        return false;
+    }
+    lines.push(line.into());
+    true
+}
+
+fn append_preview_truncation(lines: &mut Vec<String>, line: String, limit: usize) {
+    if push_preview_line(lines, line.clone(), limit) {
+        return;
+    }
+    if let Some(last) = lines.last_mut() {
+        *last = line;
+    }
+}
+
 fn apply_patch_preview_lines(patch: &str) -> Option<Vec<String>> {
+    const PREVIEW_LIMIT: usize = 7;
+
     let mut lines = Vec::new();
     let mut omitted = 0usize;
     for line in patch.lines().filter(|line| !line.trim().is_empty()) {
@@ -723,27 +748,36 @@ fn apply_patch_preview_lines(patch: &str) -> Option<Vec<String>> {
         let is_change_line = (line.starts_with('+') && !line.starts_with("+++"))
             || (line.starts_with('-') && !line.starts_with("---"));
         if is_diff_header || is_change_line {
-            if lines.len() < 7 {
-                lines.push(line.to_string());
-            } else {
+            if !push_preview_line(&mut lines, line, PREVIEW_LIMIT) {
+                omitted += 1;
+            }
+        } else {
+            omitted += 1;
+        }
+    }
+
+    if lines.is_empty() {
+        omitted = 0;
+        for line in patch.lines().filter(|line| !line.trim().is_empty()) {
+            if !push_preview_line(&mut lines, line, PREVIEW_LIMIT) {
                 omitted += 1;
             }
         }
     }
 
-    if lines.is_empty() {
-        for line in patch.lines().filter(|line| !line.trim().is_empty()).take(7) {
-            lines.push(line.to_string());
-        }
-    }
-
     if omitted > 0 {
-        lines.push(format!("... (+{omitted} more diff lines)"));
+        append_preview_truncation(
+            &mut lines,
+            format!("... (+{omitted} more patch lines)"),
+            PREVIEW_LIMIT,
+        );
     }
     if lines.is_empty() { None } else { Some(lines) }
 }
 
 fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
+    const PREVIEW_LIMIT: usize = 7;
+
     let mut lines = Vec::new();
     for (idx, change) in changes.iter().take(2).enumerate() {
         let path = change
@@ -752,21 +786,31 @@ fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
             .unwrap_or("<file>");
         let content = change.get("content").and_then(Value::as_str).unwrap_or("");
         if idx > 0 {
-            lines.push(String::new());
+            if !push_preview_line(&mut lines, String::new(), PREVIEW_LIMIT) {
+                break;
+            }
         }
-        lines.push(format!("file: {path}"));
-        let remaining = 7usize.saturating_sub(lines.len()).max(1);
-        lines.extend(
-            prefixed_preview_lines("replacement content", "+ ", content, remaining)
-                .into_iter()
-                .skip(1),
-        );
-        if lines.len() >= 7 {
+        if !push_preview_line(&mut lines, format!("file: {path}"), PREVIEW_LIMIT) {
+            break;
+        }
+        for line in prefixed_preview_lines("replacement content", "+ ", content, PREVIEW_LIMIT)
+            .into_iter()
+            .skip(1)
+        {
+            if !push_preview_line(&mut lines, line, PREVIEW_LIMIT) {
+                break;
+            }
+        }
+        if lines.len() >= PREVIEW_LIMIT {
             break;
         }
     }
     if changes.len() > 2 {
-        lines.push(format!("... (+{} more files)", changes.len() - 2));
+        append_preview_truncation(
+            &mut lines,
+            format!("... (+{} more files)", changes.len() - 2),
+            PREVIEW_LIMIT,
+        );
     }
     if lines.is_empty() { None } else { Some(lines) }
 }
@@ -798,6 +842,10 @@ fn localize_detail_label(label: &str, locale: Locale) -> &str {
             "Dir" => "目录",
             "File" => "文件",
             "Preview" => "预览",
+            "proposed content" => "拟写入内容",
+            "replace this" => "替换此内容",
+            "with this" => "替换为",
+            "replacement content" => "替换内容",
             "Path" => "路径",
             "Target" => "目标",
             "Input" => "输入",
@@ -1820,6 +1868,117 @@ mod tests {
         assert!(preview.iter().any(|line| line.starts_with("@@")));
         assert!(preview.iter().any(|line| line == "-old"));
         assert!(preview.iter().any(|line| line == "+new"));
+    }
+
+    #[test]
+    fn prominent_details_apply_patch_changes_array_preview_stays_bounded() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "apply_patch",
+            "Apply a patch",
+            &json!({
+                "changes": [
+                    {
+                        "path": "src/lib.rs",
+                        "content": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
+                    },
+                    {
+                        "path": "src/main.rs",
+                        "content": "main"
+                    },
+                    {
+                        "path": "src/extra.rs",
+                        "content": "extra"
+                    }
+                ]
+            }),
+            "tool:apply_patch",
+        );
+
+        let details = request.prominent_detail_items(Locale::En);
+        let preview = details
+            .iter()
+            .find(|detail| detail.label == "Preview")
+            .and_then(|detail| detail.shell_lines.as_ref())
+            .expect("changes preview");
+
+        assert!(
+            preview.len() <= 7,
+            "preview should stay bounded: {preview:?}"
+        );
+        assert!(preview.iter().any(|line| line == "file: src/lib.rs"));
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("... (+1 more files)")
+        );
+    }
+
+    #[test]
+    fn apply_patch_preview_counts_omitted_context_lines() {
+        let patch = r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,8 +1,8 @@
+ context one
+ context two
+-old
++new
+ context three
+ context four
+ context five
+"#;
+
+        let preview = apply_patch_preview_lines(patch).expect("patch preview");
+
+        assert!(
+            preview.len() <= 7,
+            "preview should stay bounded: {preview:?}"
+        );
+        assert!(
+            preview
+                .last()
+                .is_some_and(|line| line.contains("more patch lines")),
+            "omitted context should be counted: {preview:?}"
+        );
+    }
+
+    #[test]
+    fn preview_sublabels_are_localized_for_zh_hans() {
+        let write = ApprovalRequest::new(
+            "test-id",
+            "write_file",
+            "Write a file",
+            &json!({"path": "src/lib.rs", "content": "hello"}),
+            "tool:write_file",
+        );
+        let write_preview = write
+            .prominent_detail_items(Locale::ZhHans)
+            .into_iter()
+            .find(|detail| detail.label == "预览")
+            .and_then(|detail| detail.shell_lines)
+            .expect("localized write preview");
+        assert!(write_preview.iter().any(|line| line == "拟写入内容"));
+        assert!(!write_preview.iter().any(|line| line == "proposed content"));
+
+        let edit = ApprovalRequest::new(
+            "test-id",
+            "edit_file",
+            "Edit a file",
+            &json!({
+                "path": "src/lib.rs",
+                "search": "old_call();",
+                "replace": "new_call();"
+            }),
+            "tool:edit_file",
+        );
+        let edit_preview = edit
+            .prominent_detail_items(Locale::ZhHans)
+            .into_iter()
+            .find(|detail| detail.label == "预览")
+            .and_then(|detail| detail.shell_lines)
+            .expect("localized edit preview");
+        assert!(edit_preview.iter().any(|line| line == "替换此内容"));
+        assert!(edit_preview.iter().any(|line| line == "替换为"));
     }
 
     #[test]
