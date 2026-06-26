@@ -798,8 +798,8 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
             .replace("{sum_miss}", &totals_miss.to_string())
             .replace("{avg}", &avg_ratio),
     );
-    footer.push_str(tr(locale, MessageId::CmdCacheFootnote));
-    footer.push_str(tr(locale, MessageId::CmdCacheAdvice));
+    footer.push_str(&tr(locale, MessageId::CmdCacheFootnote));
+    footer.push_str(&tr(locale, MessageId::CmdCacheAdvice));
 
     format!("{header}{body}{footer}")
 }

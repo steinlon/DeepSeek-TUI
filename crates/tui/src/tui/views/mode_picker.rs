@@ -151,7 +151,7 @@ impl ModalView for ModePickerView {
             let name = mode.display_name_localized(self.locale);
             // Pad by terminal columns, not scalar count, so wide (CJK) mode
             // names keep the hint column aligned.
-            let pad = " ".repeat(7usize.saturating_sub(UnicodeWidthStr::width(name)));
+            let pad = " ".repeat(7usize.saturating_sub(UnicodeWidthStr::width(&*name)));
 
             lines.push(Line::from(vec![
                 Span::styled(

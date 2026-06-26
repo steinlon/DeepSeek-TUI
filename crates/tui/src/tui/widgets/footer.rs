@@ -146,7 +146,7 @@ pub fn footer_working_label(frame: u64, locale: Locale) -> String {
     let dots = (frame % 4) as usize;
     let base = tr(locale, MessageId::FooterWorking);
     let mut out = String::with_capacity(base.len() + dots);
-    out.push_str(base);
+    out.push_str(&base);
     for _ in 0..dots {
         out.push('.');
     }

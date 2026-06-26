@@ -1,5 +1,6 @@
 //! Application state for the `DeepSeek` TUI.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -958,7 +959,7 @@ impl AppMode {
 
     /// Localized short name for the mode picker (user-facing surface only).
     #[must_use]
-    pub fn display_name_localized(self, locale: Locale) -> &'static str {
+    pub fn display_name_localized(self, locale: Locale) -> Cow<'static, str> {
         tr(
             locale,
             match self {
@@ -971,7 +972,7 @@ impl AppMode {
 
     /// Localized one-line hint for the mode picker (user-facing surface only).
     #[must_use]
-    pub fn picker_hint_localized(self, locale: Locale) -> &'static str {
+    pub fn picker_hint_localized(self, locale: Locale) -> Cow<'static, str> {
         tr(
             locale,
             match self {
@@ -1163,7 +1164,7 @@ pub enum VimMode {
 impl VimMode {
     /// Localized status-bar label shown in the composer border (user-facing).
     #[must_use]
-    pub fn label_localized(self, locale: Locale) -> &'static str {
+    pub fn label_localized(self, locale: Locale) -> Cow<'static, str> {
         tr(
             locale,
             match self {
@@ -2219,7 +2220,7 @@ impl App {
         self.last_pinned_prefix_hash = None;
     }
 
-    pub fn tr(&self, id: MessageId) -> &'static str {
+    pub fn tr(&self, id: MessageId) -> Cow<'static, str> {
         tr(self.ui_locale, id)
     }
 

@@ -16,6 +16,9 @@ use wait_timeout::ChildExt;
 
 use crate::dependencies::ExternalTool;
 
+use rust_i18n::i18n;
+i18n!("locales", fallback = ["en"]);
+
 mod acp_server;
 mod artifacts;
 mod audit;

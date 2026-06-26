@@ -22,6 +22,7 @@ pub use footer::{
 pub use header::{HeaderData, HeaderWidget, header_status_indicator_frame};
 pub use renderable::Renderable;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -744,15 +745,18 @@ impl Renderable for ComposerWidget<'_> {
                 .border_style(Style::default().fg(border_color))
                 .style(background);
             if self.app.is_history_search_active() || is_draft_mode {
-                block = block.title(Line::from(Span::styled(
-                    if self.app.is_history_search_active() {
+                block = if self.app.is_history_search_active() {
+                    block.title(Line::from(Span::styled(
                         self.app
-                            .tr(crate::localization::MessageId::HistorySearchTitle)
-                    } else {
-                        "Draft"
-                    },
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
+                            .tr(crate::localization::MessageId::HistorySearchTitle),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )))
+                } else {
+                    block.title(Line::from(Span::styled(
+                        "Draft",
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )))
+                };
             }
             // Top-right corner: editor state plus transient turn receipts.
             // Receipts are lifecycle chrome, not transcript content; they
@@ -827,10 +831,12 @@ impl Renderable for ComposerWidget<'_> {
             let placeholder: &str = if let Some(ref suggestion) = self.app.prompt_suggestion {
                 suggestion.as_str()
             } else if self.app.is_history_search_active() {
-                self.app
+                &self
+                    .app
                     .tr(crate::localization::MessageId::HistorySearchPlaceholder)
             } else {
-                self.app
+                &self
+                    .app
                     .tr(crate::localization::MessageId::ComposerPlaceholder)
             };
             placeholder_visual_lines_for(placeholder, content_width)
@@ -1134,10 +1140,12 @@ impl Renderable for ComposerWidget<'_> {
             let placeholder: &str = if let Some(ref suggestion) = self.app.prompt_suggestion {
                 suggestion.as_str()
             } else if self.app.is_history_search_active() {
-                self.app
+                &self
+                    .app
                     .tr(crate::localization::MessageId::HistorySearchPlaceholder)
             } else {
-                self.app
+                &self
+                    .app
                     .tr(crate::localization::MessageId::ComposerPlaceholder)
             };
             placeholder_visual_lines_for(placeholder, content_width)
@@ -1306,7 +1314,11 @@ impl Renderable for ApprovalWidget<'_> {
                 let summary_lines: Vec<&str> = summary.lines().collect();
                 let intent_lines = if compact_vertical { 1 } else { 3 };
                 for (i, sline) in summary_lines.iter().take(intent_lines).enumerate() {
-                    let prefix = if i == 0 { intent_label } else { "  " };
+                    let prefix = if i == 0 {
+                        intent_label.clone()
+                    } else {
+                        Cow::Borrowed("  ")
+                    };
                     let truncated = crate::utils::truncate_with_ellipsis(sline, max_width, "...");
                     lines.push(Line::from(vec![
                         Span::raw("  "),
@@ -1572,14 +1584,14 @@ fn approval_option_style(is_selected: bool, color: Color) -> Style {
     }
 }
 
-fn risk_badge_text(risk: RiskLevel, locale: Locale) -> &'static str {
+fn risk_badge_text(risk: RiskLevel, locale: Locale) -> Cow<'static, str> {
     match risk {
         RiskLevel::Benign => tr(locale, MessageId::ApprovalRiskReview),
         RiskLevel::Destructive => tr(locale, MessageId::ApprovalRiskDestructive),
     }
 }
 
-fn category_label_for(category: ToolCategory, locale: Locale) -> (&'static str, Color) {
+fn category_label_for(category: ToolCategory, locale: Locale) -> (Cow<'static, str>, Color) {
     let label = match category {
         ToolCategory::Safe => tr(locale, MessageId::ApprovalCategorySafe),
         ToolCategory::FileWrite => tr(locale, MessageId::ApprovalCategoryFileWrite),
@@ -1601,23 +1613,23 @@ fn category_label_for(category: ToolCategory, locale: Locale) -> (&'static str, 
     (label, color)
 }
 
-fn approval_word(locale: Locale) -> &'static str {
+fn approval_word(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalBlockTitle)
 }
 
-fn label_type(locale: Locale) -> &'static str {
+fn label_type(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalFieldType)
 }
 
-fn label_about(locale: Locale) -> &'static str {
+fn label_about(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalFieldAbout)
 }
 
-fn label_impact(locale: Locale) -> &'static str {
+fn label_impact(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalFieldImpact)
 }
 
-fn label_params(locale: Locale) -> &'static str {
+fn label_params(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalFieldParams)
 }
 
@@ -1796,7 +1808,7 @@ fn destructive_approval_semantics(locale: Locale) -> [(&'static str, &'static st
     }
 }
 
-fn footer_controls(locale: Locale) -> &'static str {
+fn footer_controls(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalControlsHint)
 }
 
@@ -1807,16 +1819,16 @@ fn save_ask_rule_hint(locale: Locale) -> &'static str {
     }
 }
 
-fn selection_hint_prefix(locale: Locale) -> &'static str {
+fn selection_hint_prefix(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalChooseHint)
 }
 
-fn selection_hint_value(locale: Locale) -> &'static str {
+fn selection_hint_value(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalChooseAction)
 }
 
 struct ApprovalOptionRow {
-    label: &'static str,
+    label: Cow<'static, str>,
     key_hint: &'static str,
     dangerous: bool,
 }
@@ -1847,19 +1859,19 @@ fn approval_options_for(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 
     ]
 }
 
-fn option_approve_once(locale: Locale) -> &'static str {
+fn option_approve_once(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalOptionApproveOnce)
 }
 
-fn option_approve_always(locale: Locale) -> &'static str {
+fn option_approve_always(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalOptionApproveAlways)
 }
 
-fn option_deny(locale: Locale) -> &'static str {
+fn option_deny(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalOptionDeny)
 }
 
-fn option_abort(locale: Locale) -> &'static str {
+fn option_abort(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalOptionAbortTurn)
 }
 
@@ -2281,7 +2293,7 @@ fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>
         let receipt_text = receipt.trim();
         if app.composer.vim_enabled {
             let vim_label = app.composer.vim_mode.label_localized(app.ui_locale);
-            let vim_width = UnicodeWidthStr::width(vim_label);
+            let vim_width = UnicodeWidthStr::width(&*vim_label);
             let sep_width = UnicodeWidthStr::width(" · ");
             if vim_width + sep_width + 4 <= max_width {
                 let receipt_width = max_width.saturating_sub(vim_width + sep_width);
@@ -2306,7 +2318,7 @@ fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>
     if app.composer.vim_enabled {
         spans.push(Span::styled(
             truncate_display_width(
-                app.composer.vim_mode.label_localized(app.ui_locale),
+                &app.composer.vim_mode.label_localized(app.ui_locale),
                 max_width,
             ),
             vim_mode_style(app.composer.vim_mode),
@@ -4153,7 +4165,7 @@ mod tests {
         assert!(!normal_rendered.contains("Draft"));
         assert!(
             !normal_rendered
-                .contains(normal_app.tr(crate::localization::MessageId::HistorySearchTitle))
+                .contains(&*normal_app.tr(crate::localization::MessageId::HistorySearchTitle))
         );
 
         let mut draft_app = create_test_app();
@@ -4174,7 +4186,7 @@ mod tests {
         search_widget.render(area, &mut search_buf);
         assert!(
             buffer_text(&search_buf, area)
-                .contains(search_app.tr(crate::localization::MessageId::HistorySearchTitle))
+                .contains(&*search_app.tr(crate::localization::MessageId::HistorySearchTitle))
         );
     }
 
