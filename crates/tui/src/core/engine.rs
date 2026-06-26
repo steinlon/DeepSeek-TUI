@@ -114,7 +114,8 @@ impl StructuredState {
         };
 
         let subagent_snapshots = if let Some(handle) = subagents {
-            let guard = handle.read().await;
+            let mut guard = handle.write().await;
+            guard.cleanup(Duration::from_secs(60 * 60));
             guard
                 .list()
                 .into_iter()

@@ -2378,6 +2378,55 @@ async fn cleanup_auto_cancels_stale_running_agent_and_releases_slot() {
 }
 
 #[tokio::test]
+async fn status_projection_reconciles_stale_running_agent() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1)
+        .with_running_heartbeat_timeout(Duration::from_millis(1));
+    let current_boot = inner.session_boot_id().to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        "test_agent_status_stale".to_string(),
+        SubAgentType::Explore,
+        "prompt".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Blue".to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        PathBuf::from("."),
+        current_boot,
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+    inner.agents.insert(agent.id.clone(), agent);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let manager = Arc::new(RwLock::new(inner));
+    let context = ToolContext::new(".");
+    let result = inspect_agent_from_input(&json!({"action": "status"}), manager, &context, false)
+        .await
+        .expect("status projection should succeed");
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("status payload should be json");
+    let agent = payload["agents"]
+        .as_array()
+        .and_then(|agents| agents.first())
+        .expect("stale current-session agent should remain inspectable");
+
+    assert_eq!(payload["count"], 1);
+    assert_eq!(agent["agent_id"], "test_agent_status_stale");
+    assert_eq!(agent["status"], "cancelled");
+    assert_eq!(agent["terminal"], true);
+    assert_eq!(agent["snapshot"]["status"], "Cancelled");
+    assert!(
+        agent["snapshot"]["result"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Auto-cancelled")
+    );
+}
+
+#[tokio::test]
 async fn cleanup_keeps_recent_running_agent() {
     let mut manager = SubAgentManager::new(PathBuf::from("."), 1)
         .with_running_heartbeat_timeout(Duration::from_secs(300));
