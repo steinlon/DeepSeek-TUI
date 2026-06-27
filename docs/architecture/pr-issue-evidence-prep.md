@@ -1,6 +1,6 @@
 # EPIC Evidence Preparation
 
-## EPIC-002 Closure Evidence (Draft — Phase 6; awaiting code review approval for Phase 7)
+## EPIC-002 Closure Evidence (Draft — Phase 7; ready for Phase 8 final gate)
 
 **Epic:** EPIC-002 — Command Single Responsibility Extraction
 **Related EPIC:** [#2870](https://github.com/Hmbown/CodeWhale/issues/2870)
@@ -8,12 +8,12 @@
 [#2851](https://github.com/Hmbown/CodeWhale/pull/2851),
 [#2887](https://github.com/Hmbown/CodeWhale/pull/2887)
 
-This section records draft EPIC-002 closure evidence prepared during Phase 6.
-Layer 4.4 (FEAT-008) is currently in Phase 6 (Integration; awaiting code
-review approval before advancing to Phase 7). All evidence below has been
-verified by running the documented commands in the current working tree. Final
-pass/fail markers for the PR body replace these placeholders only after the
-Phase 8 final gate.
+This section records draft EPIC-002 closure evidence prepared during Phase 6
+and refined during Phase 7. Layer 4.4 (FEAT-008) is currently in Phase 7
+(Testing and Polish; documentation and evidence review). All evidence below
+has been verified by running the documented commands in the current working
+tree. Final pass/fail markers for the PR body replace these placeholders only
+after the Phase 8 final gate.
 
 ### PR References
 
