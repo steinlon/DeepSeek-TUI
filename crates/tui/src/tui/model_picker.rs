@@ -218,6 +218,17 @@ impl ModelPickerView {
                 .show_custom_model_row
                 .then(|| (self.initial_model.clone(), self.initial_provider));
         }
+        if let Some((provider, model)) = self.provider_qualified_custom_query(query) {
+            if visible_rows.iter().any(|row| {
+                row.provider == Some(provider) && row.id.eq_ignore_ascii_case(model.trim())
+            }) {
+                return None;
+            }
+            if self.provider_accepts_custom_model(provider, &model) {
+                return Some((model, provider));
+            }
+            return None;
+        }
         if !self.active_accepts_custom_model_ids {
             return None;
         }
@@ -227,6 +238,28 @@ impl ModelPickerView {
             return None;
         }
         Some((query.to_string(), self.initial_provider))
+    }
+
+    fn provider_qualified_custom_query(&self, query: &str) -> Option<(ApiProvider, String)> {
+        for (provider_key, model) in provider_query_splits(query) {
+            let Some(provider) = ApiProvider::parse(provider_key) else {
+                continue;
+            };
+            if provider != self.initial_provider && !self.configured_providers.contains(&provider) {
+                continue;
+            }
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            return Some((provider, model.to_string()));
+        }
+        None
+    }
+
+    fn provider_accepts_custom_model(&self, provider: ApiProvider, model: &str) -> bool {
+        (provider == self.initial_provider && self.active_accepts_custom_model_ids)
+            || crate::config::normalize_model_name_for_provider(provider, model).is_some()
     }
 
     fn clamp_model_selection(&mut self) {
@@ -569,6 +602,19 @@ fn push_model_id(models: &mut Vec<String>, model: &str) {
     {
         models.push(model.to_string());
     }
+}
+
+fn provider_query_splits(query: &str) -> Vec<(&str, &str)> {
+    let trimmed = query.trim();
+    let mut splits = Vec::new();
+    if let Some((provider, model)) = trimmed.split_once(':') {
+        splits.push((provider.trim(), model.trim()));
+    }
+    if let Some(idx) = trimmed.find(char::is_whitespace) {
+        let (provider, model) = trimmed.split_at(idx);
+        splits.push((provider.trim(), model.trim()));
+    }
+    splits
 }
 
 fn push_model_row(
@@ -1071,6 +1117,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_query_splits_support_colon_and_space_forms() {
+        assert_eq!(
+            provider_query_splits("openrouter:anthropic/claude-sonnet-4"),
+            vec![("openrouter", "anthropic/claude-sonnet-4")]
+        );
+        assert_eq!(
+            provider_query_splits("openrouter anthropic/claude-sonnet-4"),
+            vec![("openrouter", "anthropic/claude-sonnet-4")]
+        );
+        assert_eq!(
+            provider_query_splits("openrouter anthropic/foo:bar"),
+            vec![
+                ("openrouter anthropic/foo", "bar"),
+                ("openrouter", "anthropic/foo:bar")
+            ]
+        );
+    }
+
+    #[test]
     fn picker_main_rows_are_scoped_to_active_provider() {
         let (mut app, config, _lock) = create_test_app();
         app.api_provider = crate::config::ApiProvider::Together;
@@ -1414,6 +1479,47 @@ mod tests {
             }) => {
                 assert_eq!(model, "custom-org/custom-model");
                 assert_eq!(provider, None, "active-provider custom row is not a switch");
+            }
+            other => panic!("expected ModelPickerApplied EmitAndClose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_query_provider_qualified_custom_row_targets_configured_provider() {
+        let (mut app, _default_config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    api_key: Some("test-openrouter-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let mut view = ModelPickerView::new(&app, &config);
+        type_model_query(&mut view, "openrouter:anthropic/custom-sonnet");
+
+        assert_eq!(view.resolved_model(), "anthropic/custom-sonnet");
+        assert_eq!(
+            view.resolved_provider(),
+            Some(crate::config::ApiProvider::Openrouter)
+        );
+        let action = view.handle_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied {
+                model, provider, ..
+            }) => {
+                assert_eq!(model, "anthropic/custom-sonnet");
+                assert_eq!(provider, Some(crate::config::ApiProvider::Openrouter));
             }
             other => panic!("expected ModelPickerApplied EmitAndClose, got {other:?}"),
         }
