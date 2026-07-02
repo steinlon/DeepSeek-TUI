@@ -75,6 +75,7 @@ mod prompts;
 mod purge;
 mod remote_setup;
 pub mod repl;
+mod repo_law;
 mod request_tuning;
 mod resource_telemetry;
 mod retry_status;

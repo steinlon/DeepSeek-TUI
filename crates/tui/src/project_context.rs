@@ -208,9 +208,12 @@ struct RepoConstitution {
     /// (highest authority first).
     #[serde(default)]
     authority: Option<Vec<String>>,
-    /// Repo invariants the agent must not break.
+    /// Repo invariants the agent must not break. Plain strings are advisory
+    /// prose (rendered into the prompt only); object entries with `paths`
+    /// are additionally compiled into mechanical write holds (see
+    /// `crate::repo_law`). Law can only tighten — there is no allow shape.
     #[serde(default)]
-    protected_invariants: Option<Vec<String>>,
+    protected_invariants: Option<Vec<ProtectedInvariant>>,
     /// Branch / release policy in effect (e.g. "PRs target codex/v0.8.53").
     #[serde(default)]
     branch_policy: Option<String>,
@@ -228,13 +231,138 @@ struct VerificationPolicy {
     before_claiming_done: Option<Vec<String>>,
 }
 
+/// One protected invariant: either advisory prose (the historical shape) or
+/// an enforced entry carrying path globs. Untagged so existing files keep
+/// parsing unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ProtectedInvariant {
+    Advisory(String),
+    Enforced(EnforcedInvariant),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EnforcedInvariant {
+    text: String,
+    /// Workspace-relative path globs this invariant protects (e.g.
+    /// `crates/protocol/**`). Empty means advisory-only despite the shape.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// What the harness does when a write targets a protected path.
+    #[serde(default)]
+    action: RepoLawAction,
+}
+
+/// Enforcement level for a protected path. `Ask` force-prompts (in every
+/// mode, including YOLO — law can add holds, never remove them); `Block`
+/// denies outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RepoLawAction {
+    #[default]
+    Ask,
+    Block,
+}
+
+impl ProtectedInvariant {
+    fn text(&self) -> &str {
+        match self {
+            Self::Advisory(text) => text,
+            Self::Enforced(enforced) => &enforced.text,
+        }
+    }
+}
+
+/// A compiled, mechanically-enforceable repo-law rule.
+pub(crate) struct RepoLawRule {
+    pub(crate) text: String,
+    pub(crate) patterns: Vec<String>,
+    pub(crate) globs: globset::GlobSet,
+    pub(crate) action: RepoLawAction,
+}
+
+/// Load and compile the enforceable rules from the workspace's repo
+/// constitution. Any failure — missing file, parse error, invalid glob —
+/// degrades to fewer (or zero) rules: enforcement can silently do less,
+/// never more, and never poisons the tool gate. Parse warnings still reach
+/// the user through the prompt-side load path, which reads the same file.
+pub(crate) fn load_repo_law_rules(workspace: &Path) -> Vec<RepoLawRule> {
+    let Some((_, constitution)) = discover_repo_constitution(workspace) else {
+        return Vec::new();
+    };
+    let mut rules = Vec::new();
+    for invariant in constitution.protected_invariants.into_iter().flatten() {
+        let ProtectedInvariant::Enforced(enforced) = invariant else {
+            continue;
+        };
+        if enforced.text.trim().is_empty() {
+            continue;
+        }
+        let mut builder = globset::GlobSetBuilder::new();
+        let mut patterns = Vec::new();
+        for pattern in &enforced.paths {
+            let trimmed = pattern.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(glob) = globset::Glob::new(trimmed) {
+                builder.add(glob);
+                patterns.push(trimmed.to_string());
+            }
+        }
+        if patterns.is_empty() {
+            continue;
+        }
+        let Ok(globs) = builder.build() else {
+            continue;
+        };
+        rules.push(RepoLawRule {
+            text: enforced.text.trim().to_string(),
+            patterns,
+            globs,
+            action: enforced.action,
+        });
+    }
+    rules
+}
+
+/// Walk from `workspace` toward the git root looking for the repo
+/// constitution; parse best-effort. Shared by the enforcement loader; the
+/// prompt-side loader keeps its richer warning handling.
+fn discover_repo_constitution(workspace: &Path) -> Option<(PathBuf, RepoConstitution)> {
+    let git_root = find_git_root(workspace);
+    let mut current = workspace.to_path_buf();
+    loop {
+        let mut path = current.clone();
+        for component in REPO_CONSTITUTION_RELATIVE_PATH {
+            path.push(component);
+        }
+        if context_candidate_exists(&path) {
+            let constitution = load_context_file(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<RepoConstitution>(&raw).ok())?;
+            return Some((path, constitution));
+        }
+        if let Some(ref root) = git_root
+            && current == *root
+        {
+            break;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    None
+}
+
 impl RepoConstitution {
     /// True when the file carried no usable policy (so we can skip emitting an
     /// empty block).
     fn is_empty(&self) -> bool {
         let list_empty = |l: &Option<Vec<String>>| l.as_ref().is_none_or(Vec::is_empty);
         list_empty(&self.authority)
-            && list_empty(&self.protected_invariants)
+            && self.protected_invariants.as_ref().is_none_or(Vec::is_empty)
             && list_empty(&self.escalate_when)
             && self
                 .branch_policy
@@ -262,7 +390,27 @@ impl RepoConstitution {
         if let Some(invariants) = self.protected_invariants.as_ref().filter(|i| !i.is_empty()) {
             body.push_str("\nProtected invariants — do not break:\n");
             for item in invariants {
-                body.push_str(&format!("- {item}\n"));
+                match item {
+                    ProtectedInvariant::Advisory(text) => {
+                        body.push_str(&format!("- {text}\n"));
+                    }
+                    ProtectedInvariant::Enforced(enforced) => {
+                        let paths = enforced
+                            .paths
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if paths.is_empty() {
+                            body.push_str(&format!("- {}\n", enforced.text));
+                        } else {
+                            body.push_str(&format!(
+                                "- {} (mechanically enforced for: {paths})\n",
+                                enforced.text
+                            ));
+                        }
+                    }
+                }
             }
         }
         if let Some(policy) = self.branch_policy.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -1208,6 +1356,64 @@ pub fn merge_contexts(contexts: &[ProjectContext]) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn mixed_advisory_and_enforced_invariants_render_and_back_compat_holds() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join(".codewhale");
+        fs::create_dir_all(&dir).expect("law dir");
+        fs::write(
+            dir.join("constitution.json"),
+            r#"{
+                "protected_invariants": [
+                    "Plain advisory prose.",
+                    { "text": "The wire format is frozen", "paths": ["crates/protocol/**"], "action": "block" }
+                ]
+            }"#,
+        )
+        .expect("write law");
+
+        let (block, path, warnings) = load_repo_constitution_block(tmp.path());
+        let block = block.expect("law renders");
+        assert!(path.is_some());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(block.contains("- Plain advisory prose."), "{block}");
+        assert!(
+            block.contains(
+                "- The wire format is frozen (mechanically enforced for: crates/protocol/**)"
+            ),
+            "{block}"
+        );
+
+        // The enforcement loader compiles only the enforced entry.
+        let rules = load_repo_law_rules(tmp.path());
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].text, "The wire format is frozen");
+        assert_eq!(rules[0].action, RepoLawAction::Block);
+        assert!(rules[0].globs.is_match("crates/protocol/wire.rs"));
+    }
+
+    #[test]
+    fn legacy_string_only_invariants_render_unchanged_and_compile_nothing() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join(".codewhale");
+        fs::create_dir_all(&dir).expect("law dir");
+        fs::write(
+            dir.join("constitution.json"),
+            r#"{"protected_invariants": ["Keep DeepSeek support first-class."]}"#,
+        )
+        .expect("write law");
+
+        let (block, _, warnings) = load_repo_constitution_block(tmp.path());
+        let block = block.expect("law renders");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            block.contains("- Keep DeepSeek support first-class."),
+            "{block}"
+        );
+        assert!(!block.contains("mechanically enforced"), "{block}");
+        assert!(load_repo_law_rules(tmp.path()).is_empty());
+    }
 
     #[test]
     fn test_load_project_context_empty() {

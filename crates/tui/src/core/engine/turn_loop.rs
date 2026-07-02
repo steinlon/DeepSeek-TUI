@@ -1828,6 +1828,43 @@ impl Engine {
                     }
                 }
 
+                // Repo law: protected invariants with path globs compile into
+                // mechanical write holds. Like the safety floor, law is not
+                // bypassable by mode — it can only add holds, never remove
+                // one, so this cannot weaken any gate above.
+                if blocked_error.is_none()
+                    && let Some(decision) = crate::repo_law::repo_law_plan_decision(
+                        &self.session.workspace,
+                        &tool_name,
+                        &tool_input,
+                    )
+                {
+                    emit_tool_audit(json!({
+                        "event": "tool.repo_law_decision",
+                        "tool_id": tool_id.clone(),
+                        "decision": match &decision {
+                            crate::repo_law::RepoLawPlanDecision::ForcePrompt(_) => "force_prompt",
+                            crate::repo_law::RepoLawPlanDecision::Block(_) => "block",
+                        },
+                        "reason": match &decision {
+                            crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason)
+                            | crate::repo_law::RepoLawPlanDecision::Block(reason) => reason.clone(),
+                        },
+                    }));
+                    match decision {
+                        crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
+                            approval_required = true;
+                            approval_description = reason;
+                            approval_force_prompt = true;
+                        }
+                        crate::repo_law::RepoLawPlanDecision::Block(reason) => {
+                            approval_required = false;
+                            approval_force_prompt = false;
+                            blocked_error = Some(ToolError::permission_denied(reason));
+                        }
+                    }
+                }
+
                 let should_emit_hydration_status =
                     !deferred_tools_hydrated_this_batch.contains(&tool_name);
                 if blocked_error.is_none()

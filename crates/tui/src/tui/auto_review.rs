@@ -397,12 +397,14 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
         .any(|tokens| shell_tokens_are_publish_like(&tokens))
 }
 
-/// True when any segment of the shell command is flagged `Dangerous` by the
-/// command-safety analyzer (`rm -rf`, `dd` to a device, `mkfs`, piping a
-/// download into a shell, ...). This is what keeps the background/headless
-/// durable-review floor armed for genuinely destructive shell work now that
-/// the floor no longer treats every non-read-only command as destructive
-/// (#3883).
+/// True when any segment of the shell command is genuinely destructive: the
+/// command-safety analyzer's `Dangerous` verdict (`rm -rf /`, `curl | sh`,
+/// `eval`, fork bombs) OR the catastrophic-write classes
+/// [`segment_is_device_or_filesystem_destroyer`] adds (`dd` to a device,
+/// `mkfs`/`shred`/`wipefs`, forced recursive deletion of an absolute system
+/// path). This is what keeps the background/headless durable-review floor
+/// armed now that the floor no longer treats every non-read-only command as
+/// destructive (#3883).
 fn shell_params_are_destructive_like(params: &Value) -> bool {
     let Some(command) = params
         .get("command")
@@ -417,7 +419,59 @@ fn shell_params_are_destructive_like(params: &Value) -> bool {
         .any(|segment| {
             crate::command_safety::analyze_command(segment).level
                 == crate::command_safety::SafetyLevel::Dangerous
+                || segment_is_device_or_filesystem_destroyer(segment)
         })
+}
+
+/// The non-bypassable floor must hold genuinely catastrophic writes even when
+/// `command_safety` (tuned to avoid over-blocking build/test chains) rates
+/// them merely `RequiresApproval`. This covers the classes that irreversibly
+/// destroy a disk or a system tree — `dd`/`shred`/`wipefs` onto a device,
+/// `mkfs`, and forced recursive deletion of an absolute system path — so a
+/// background/headless call in YOLO cannot run them without durable review
+/// (#3883 follow-up; the earlier narrowing lost this coverage).
+fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let Some(cmd) = tokens.first().map(|t| t.trim_start_matches("./")) else {
+        return false;
+    };
+    let base = cmd.rsplit('/').next().unwrap_or(cmd);
+    // Filesystem creation / whole-device wipes: the target IS destruction.
+    if matches!(base, "mkfs" | "wipefs" | "shred" | "blkdiscard") || base.starts_with("mkfs.") {
+        return true;
+    }
+    // `dd` writing to a block device (of=/dev/...): overwrites the raw disk.
+    if base == "dd" {
+        return tokens.iter().any(|t| {
+            t.strip_prefix("of=")
+                .is_some_and(|dest| dest.starts_with("/dev/"))
+        });
+    }
+    // Forced recursive deletion aimed at an absolute path outside the
+    // workspace (e.g. `rm -rf /etc`, `/usr`, `/var`): command_safety only
+    // flags root/home/parent-escape, so catch absolute-system targets here.
+    if base == "rm" {
+        let mut recursive = false;
+        let mut force = false;
+        let mut abs_system_target = false;
+        for token in &tokens[1..] {
+            if token.starts_with("--") {
+                match *token {
+                    "--recursive" | "--dir" => recursive = true,
+                    "--force" => force = true,
+                    _ => {}
+                }
+            } else if let Some(flags) = token.strip_prefix('-') {
+                recursive |= flags.contains('r') || flags.contains('R');
+                force |= flags.contains('f');
+            } else if token.starts_with('/') {
+                // Any absolute target that is not clearly inside a temp dir.
+                abs_system_target = true;
+            }
+        }
+        return recursive && force && abs_system_target;
+    }
+    false
 }
 
 fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
@@ -687,6 +741,55 @@ mod tests {
 
         assert_ne!(decision.action, AutoReviewAction::HoldForReview);
         assert_ne!(decision.action, AutoReviewAction::Block);
+    }
+
+    #[test]
+    fn background_device_and_filesystem_destroyers_are_held_by_safety_floor() {
+        // #3883 follow-up: the narrowed floor must still hold catastrophic
+        // writes that command_safety rates only RequiresApproval, even in
+        // Bypass/background.
+        let policy = AutoReviewPolicy::default();
+        for command in [
+            "dd if=/dev/zero of=/dev/sda bs=1M",
+            "mkfs.ext4 /dev/sda1",
+            "shred -n 3 /dev/sda",
+            "wipefs -a /dev/sda",
+            "rm -rf /etc/nginx",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+            );
+            let decision = policy.evaluate(&ctx);
+            assert_eq!(
+                decision.action,
+                AutoReviewAction::HoldForReview,
+                "{command} must hold"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_dd_and_workspace_rm_do_not_trip_the_destroyer_check() {
+        let policy = AutoReviewPolicy::default();
+        // dd to a regular file, and forced recursive delete of a relative
+        // workspace path, are not device/system destroyers.
+        for command in ["dd if=in.img of=out.img", "rm -rf target/debug"] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+            );
+            let decision = policy.evaluate(&ctx);
+            assert_ne!(
+                decision.action,
+                AutoReviewAction::HoldForReview,
+                "{command} must not hold"
+            );
+        }
     }
 
     #[test]
