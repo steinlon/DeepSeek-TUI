@@ -4115,6 +4115,39 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
     })
 }
 
+fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
+    use serde_json::json;
+
+    let provider = config.api_provider();
+    let auth_source = resolve_api_key_source(config);
+    let credential_url = provider.credential_url();
+
+    json!({
+        "provider": {
+            "id": provider.as_str(),
+            "display": provider.display_name(),
+        },
+        "model": {
+            "resolved": config.default_model(),
+        },
+        "auth": {
+            "present_or_local": crate::config::has_api_key_for(config, provider),
+            "source": doctor_api_key_source_label(auth_source),
+            "env_vars": provider.env_vars(),
+            "credential_url": credential_url,
+            "oauth_only": provider == crate::config::ApiProvider::OpenaiCodex,
+        },
+        "health": {
+            "live_validation": false,
+            "next_action": if auth_source == ApiKeySource::Missing {
+                "/setup provider or /provider setup <name>"
+            } else {
+                "/model"
+            },
+        },
+    })
+}
+
 fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
     use serde_json::json;
 
@@ -4208,6 +4241,7 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
                 "source": "workspace",
             },
         },
+        "provider_model": doctor_provider_model_report_json(config),
         "operate_fleet": doctor_operate_fleet_report_json(config, workspace),
         "consistency": doctor_setup_consistency(&state, source),
         "next_actions": {
@@ -8470,6 +8504,22 @@ mod doctor_setup_state_tests {
             report["operate_fleet"]["roster"]["readiness_rule"],
             "built-in starter roster or custom roster"
         );
+        assert_eq!(report["provider_model"]["provider"]["id"], "deepseek");
+        assert_eq!(report["provider_model"]["provider"]["display"], "DeepSeek");
+        assert_eq!(
+            report["provider_model"]["model"]["resolved"],
+            crate::config::DEFAULT_TEXT_MODEL
+        );
+        assert_eq!(report["provider_model"]["auth"]["source"], "missing");
+        assert_eq!(
+            report["provider_model"]["auth"]["credential_url"],
+            "https://platform.deepseek.com/api_keys"
+        );
+        assert_eq!(
+            report["provider_model"]["auth"]["env_vars"][0],
+            "DEEPSEEK_API_KEY"
+        );
+        assert_eq!(report["provider_model"]["health"]["live_validation"], false);
         assert_eq!(report["constitution"]["source"], "bundled");
         assert_eq!(report["constitution"]["autonomy_preference"], "unspecified");
         assert_eq!(report["runtime_posture"]["source"], "unset");
