@@ -31,6 +31,7 @@ v0.8.8 onward. Linux RISC-V prebuilts are temporarily paused because the locked
 | ------------ | ------------ | :---------: | :-------------: | ----------------------------------------------------- |
 | Linux        | x64 (x86_64) |     ✅      |       ✅        | `codewhale-linux-x64`, `codew-linux-x64`, `codewhale-tui-linux-x64`        |
 | Linux        | arm64        |     ✅      |       ✅        | `codewhale-linux-arm64`, `codew-linux-arm64`, `codewhale-tui-linux-arm64`    |
+| Android / Termux | arm64 (aarch64) | ❌¹ | ✅² | `codewhale-android-arm64.tar.gz` Termux archive when published |
 | Linux        | riscv64      |     ❌¹     |       ❌³       | temporarily unsupported until upstream bindings land |
 | macOS        | x64          |     ✅      |       ✅        | `codewhale-macos-x64`, `codew-macos-x64`, `codewhale-tui-macos-x64`        |
 | macOS        | arm64 (M-series) | ✅      |       ✅        | `codewhale-macos-arm64`, `codew-macos-arm64`, `codewhale-tui-macos-arm64`    |
@@ -44,6 +45,11 @@ v0.8.8 onward. Linux RISC-V prebuilts are temporarily paused because the locked
   [Build from source](#7-build-from-source) below.
 ³ RISC-V source builds currently need upstream `rquickjs-sys` RISC-V bindings or
   a bindgen-enabled dependency build.
+
+Android / Termux is not the same target as Linux arm64. Do not install the
+GNU libc `codewhale-linux-arm64` archive in Termux; use the Termux-specific
+Android archive when a release or release candidate publishes one, or build
+from source inside Termux.
 
 The Linux **x64** release assets have been **static (musl) builds** since v0.8.65.
 They have no glibc dependency and run on any x86_64 Linux, including Ubuntu
@@ -90,6 +96,83 @@ should build from source.
 > For HarmonyOS PC and OpenHarmony cross-build setup, see
 > [HarmonyOS and OpenHarmony](HarmonyOS.md).
 
+### Android / Termux arm64
+
+Termux runs on Android's Bionic libc and uses `$PREFIX` as its Unix prefix, so
+it needs a Termux-specific Android arm64 archive. The Linux arm64 release asset
+is a GNU libc build for normal Linux distributions and should not be used on
+Android.
+
+Install the minimum archive/runtime tools first:
+
+```bash
+pkg update
+pkg install -y ca-certificates curl tar gzip coreutils
+```
+
+When the release includes `codewhale-android-arm64.tar.gz`, install it with the
+archive's bundled installer. Passing `PREFIX="$PREFIX"` matters: the installer
+defaults to `~/.local`, while Termux users normally expect commands under
+`$PREFIX/bin`.
+
+```bash
+cd "$HOME"
+curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
+curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
+sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
+
+tar xzf codewhale-android-arm64.tar.gz
+cd codewhale-android-arm64
+PREFIX="$PREFIX" ./install.sh
+hash -r
+```
+
+If you are validating from source or building a release candidate locally,
+install the build packages before running Cargo:
+
+```bash
+pkg install -y rust clang pkg-config make git
+cargo install codewhale-cli --locked
+cargo install codewhale-tui --locked
+```
+
+First-run setup is the same as other platforms. Prefer `codewhale auth set` or
+provider environment variables; do not assume a desktop Secret Service keyring
+exists inside Termux.
+
+```bash
+codewhale auth set --provider deepseek
+codewhale auth status
+codewhale doctor
+```
+
+Maintainers should use this repeatable smoke checklist for a Termux / Android
+arm64 release candidate:
+
+```bash
+command -v codewhale codew codewhale-tui
+test -x "$PREFIX/bin/codewhale"
+test -x "$PREFIX/bin/codew"
+test -x "$PREFIX/bin/codewhale-tui"
+
+codewhale --version
+codewhale doctor
+codewhale exec --auto "run pwd"
+codewhale-tui --no-alt-screen
+```
+
+Known limitations:
+
+- Sandbox behavior must be verified on-device. Android kernels and Termux
+  packaging may not expose the same Landlock, seccomp, or Bubblewrap behavior
+  documented for desktop/server Linux.
+- OS keyring behavior is best-effort. If Termux cannot provide a usable secret
+  store, use `codewhale auth status` to confirm the actual source and fall back
+  to provider env vars or config-backed auth.
+- Terminal rendering varies by Android terminal app. Use
+  `codewhale-tui --no-alt-screen` in smoke tests before trying the full-screen
+  TUI.
+
 ---
 
 ## 2. Download safety and checksums
@@ -99,8 +182,10 @@ Official release binaries are published only from
 `codewhale`. Do not install release assets from look-alike repositories,
 archives, or search-result mirrors unless you deliberately trust that mirror.
 
-Every GitHub release includes `codewhale-artifacts-sha256.txt`. If you download
-binaries manually, verify them before running:
+Every GitHub release includes checksum manifests. Use
+`codewhale-artifacts-sha256.txt` for bare binaries and
+`codewhale-bundles-sha256.txt` for `.tar.gz` / `.zip` platform archives. If you
+download binaries manually, verify them before running:
 
 ```bash
 # Run from the directory containing the downloaded binaries.
