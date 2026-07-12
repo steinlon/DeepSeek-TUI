@@ -9,7 +9,9 @@
 //!   `ConfigUpdated{persist:false}` to restore the original theme name
 //!   that was active when the picker opened.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -36,6 +38,8 @@ pub struct ThemePickerView {
     /// Effective session treatment, reported separately from theme so the
     /// picker never claims an ombre is active under Terminal or Flat.
     ocean_treatment: String,
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
+    last_mouse_selected: Option<usize>,
 }
 
 impl ThemePickerView {
@@ -58,6 +62,8 @@ impl ThemePickerView {
             original_name,
             system_ui_theme: UiTheme::detect(),
             ocean_treatment,
+            row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
         }
     }
 
@@ -122,11 +128,36 @@ impl ModalView for ThemePickerView {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.move_up(),
-            MouseEventKind::ScrollDown => self.move_down(),
-            _ => {}
+            MouseEventKind::ScrollUp => {
+                self.move_up();
+                self.last_mouse_selected = None;
+                self.preview_event()
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_down();
+                self.last_mouse_selected = None;
+                self.preview_event()
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().find_map(|(rect, idx)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*idx)
+                });
+                if let Some(idx) = clicked {
+                    let commit = self.last_mouse_selected == Some(idx) && self.selected == idx;
+                    self.selected = idx;
+                    self.last_mouse_selected = Some(idx);
+                    if commit {
+                        self.commit_event()
+                    } else {
+                        self.preview_event()
+                    }
+                } else {
+                    ViewAction::None
+                }
+            }
+            _ => ViewAction::None,
         }
-        ViewAction::None
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
@@ -170,6 +201,7 @@ impl ModalView for ThemePickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         // The live theme has already been swapped under us via ConfigUpdated,
         // so we pull the *current* preview's UiTheme from the cursor row to
         // skin the modal chrome. That way the popup itself shifts color as
@@ -233,6 +265,10 @@ impl ModalView for ThemePickerView {
             .skip(start)
             .take(visible_rows)
         {
+            let row_y = content.y.saturating_add(lines.len() as u16);
+            self.row_hitboxes
+                .borrow_mut()
+                .push((Rect::new(content.x, row_y, content.width, 1), idx));
             let id = *id;
             let is_selected = idx == self.selected;
             let row_style = if is_selected {
@@ -334,6 +370,35 @@ mod tests {
         let action = v.handle_key(key(KeyCode::Down));
         assert!(matches!(action, ViewAction::Emit(_)));
         assert_eq!(selected_name(&action), Some(ThemeId::Terminal.name()));
+    }
+
+    #[test]
+    fn mouse_wheel_previews_and_second_row_click_commits() {
+        let mut v = ThemePickerView::new("system".to_string());
+        let wheel = v.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(wheel, ViewAction::Emit(_)));
+        assert_eq!(selected_name(&wheel), Some(ThemeId::Terminal.name()));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf);
+        let (rect, idx) = v.row_hitboxes.borrow()[2];
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let preview = v.handle_mouse(click);
+        assert!(matches!(preview, ViewAction::Emit(_)));
+        assert_eq!(v.selected, idx);
+        let commit = v.handle_mouse(click);
+        assert!(matches!(commit, ViewAction::EmitAndClose(_)));
     }
 
     #[test]

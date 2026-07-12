@@ -13,8 +13,9 @@
 //! at the call-site (`tui::ui`) also toggles the overlay closed.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -86,6 +87,7 @@ pub struct HelpView {
     filtered: Vec<usize>,
     query: String,
     selected: usize,
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
 }
 
 impl Default for HelpView {
@@ -107,6 +109,7 @@ impl HelpView {
             filtered: Vec::new(),
             query: String::new(),
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
         };
         view.refilter();
         view
@@ -300,6 +303,14 @@ impl ModalView for HelpView {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.move_selection(-1),
             MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(slot) = self.row_hitboxes.borrow().iter().find_map(|(rect, slot)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*slot)
+                }) {
+                    self.selected = slot;
+                }
+            }
             _ => {}
         }
         ViewAction::None
@@ -372,6 +383,7 @@ impl ModalView for HelpView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         let inner = render_underwater_surface(
             area,
             buf,
@@ -424,6 +436,20 @@ impl ModalView for HelpView {
         )));
         lines.push(Line::from(""));
 
+        let rows = self.render_rows();
+        let visible_rows = content.height.saturating_sub(lines.len() as u16) as usize;
+        let row_start = Self::visible_row_start(&rows, self.selected, visible_rows.max(1));
+        // Reserve the rail before calculating column widths. Otherwise the
+        // description column writes beneath the rail on compact terminals.
+        let content = render_panel_scroll_rail(
+            content,
+            buf,
+            rows.len(),
+            row_start,
+            visible_rows.max(1),
+            true,
+        );
+
         if self.filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 self.tr(MessageId::HelpNoMatches),
@@ -447,9 +473,6 @@ impl ModalView for HelpView {
                 .saturating_sub(header_lines)
                 .max(1);
 
-            let rows = self.render_rows();
-            let row_start = Self::visible_row_start(&rows, self.selected, visible_budget);
-
             for row in rows.iter().skip(row_start).take(visible_budget) {
                 match *row {
                     HelpRenderRow::Section(section) => {
@@ -466,6 +489,10 @@ impl ModalView for HelpView {
                         )));
                     }
                     HelpRenderRow::Entry { slot, entry_idx } => {
+                        let row_y = content.y.saturating_add(lines.len() as u16);
+                        self.row_hitboxes
+                            .borrow_mut()
+                            .push((Rect::new(content.x, row_y, content.width, 1), slot));
                         let entry = &self.entries[entry_idx];
                         let is_selected = slot == self.selected;
                         let style = if is_selected {
@@ -486,17 +513,6 @@ impl ModalView for HelpView {
             }
         }
 
-        let rows = self.render_rows();
-        let visible_rows = content.height.saturating_sub(3) as usize;
-        let row_start = Self::visible_row_start(&rows, self.selected, visible_rows.max(1));
-        let content = render_panel_scroll_rail(
-            content,
-            buf,
-            rows.len().saturating_add(3),
-            row_start,
-            visible_rows.max(1),
-            true,
-        );
         Paragraph::new(lines).render(content, buf);
     }
 }
@@ -657,6 +673,24 @@ mod tests {
         assert_eq!(view.selected, 0);
         view.handle_key(key(KeyCode::End));
         assert_eq!(view.selected, view.filtered.len() - 1);
+    }
+
+    #[test]
+    fn mouse_click_selects_visible_help_row() {
+        let mut view = HelpView::new();
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let (rect, slot) = view.row_hitboxes.borrow()[1];
+
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(view.selected, slot);
     }
 
     #[test]

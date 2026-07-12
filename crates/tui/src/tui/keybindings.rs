@@ -86,11 +86,6 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "Ctrl+↑ / Ctrl+↓",
-        description_id: crate::localization::MessageId::KbNavigateHistory,
-        section: KeybindingSection::Navigation,
-    },
-    KeybindingEntry {
         chord: "Alt+↑ / Alt+↓",
         description_id: crate::localization::MessageId::KbScrollTranscriptAlt,
         section: KeybindingSection::Navigation,
@@ -111,12 +106,12 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "g / G",
+        chord: "Alt+G / Alt+Shift+G",
         description_id: crate::localization::MessageId::KbJumpTopBottomEmpty,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "[ / ]",
+        chord: "Alt+[ / Alt+]",
         description_id: crate::localization::MessageId::KbJumpToolBlocks,
         section: KeybindingSection::Navigation,
     },
@@ -208,7 +203,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "l",
+        chord: "Alt+L",
         description_id: crate::localization::MessageId::KbLastMessagePager,
         section: KeybindingSection::Submission,
     },
@@ -292,7 +287,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     },
     // --- Help ---
     KeybindingEntry {
-        chord: "?",
+        chord: "Alt+?",
         description_id: crate::localization::MessageId::KbHelpOverlay,
         section: KeybindingSection::Help,
     },
@@ -335,15 +330,29 @@ mod tests {
     }
 
     #[test]
-    fn help_section_documents_question_mark() {
-        // The whole point of #93 is that `?` opens this overlay; if the entry
-        // ever disappears the user-facing discoverability promise breaks.
+    fn help_section_documents_modified_question_mark() {
         assert!(
             KEYBINDINGS
                 .iter()
-                .any(|entry| entry.chord.contains('?') && entry.section == KeybindingSection::Help),
-            "`?` must remain documented as the help-toggle chord"
+                .any(|entry| entry.chord == "Alt+?" && entry.section == KeybindingSection::Help),
+            "Alt+? must remain documented as the help-toggle chord"
         );
+    }
+
+    #[test]
+    fn transcript_navigation_catalog_does_not_advertise_bare_typing_keys() {
+        for stale in ["g / G", "[ / ]", "l", "?", "Ctrl+↑ / Ctrl+↓"] {
+            assert!(
+                KEYBINDINGS.iter().all(|entry| entry.chord != stale),
+                "stale handler-free chord remains documented: {stale}"
+            );
+        }
+        for wired in ["Alt+G / Alt+Shift+G", "Alt+[ / Alt+]", "Alt+L", "Alt+?"] {
+            assert!(
+                KEYBINDINGS.iter().any(|entry| entry.chord == wired),
+                "wired transcript shortcut missing from help: {wired}"
+            );
+        }
     }
 
     #[test]

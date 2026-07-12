@@ -471,6 +471,15 @@ impl Settings {
 
     /// Load settings from disk, or return defaults if not found
     pub fn load() -> Result<Self> {
+        let mut settings = Self::load_persisted()?;
+        settings.apply_env_overrides();
+        Ok(settings)
+    }
+
+    /// Load the normalized values stored on disk without terminal/runtime
+    /// overlays. Configuration editors use this path so a value labelled
+    /// "saved" never silently reports a tmux, SSH, or accessibility override.
+    pub(crate) fn load_persisted() -> Result<Self> {
         let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
         let write_path = primary
             .as_ref()
@@ -483,7 +492,7 @@ impl Settings {
             resolve_settings_path_from_candidates(primary, legacy_home, legacy_config_dir)
                 .unwrap_or_else(|_| write_path.clone());
 
-        let mut settings = if !read_path.exists() {
+        let settings = if !read_path.exists() {
             Self::default()
         } else {
             let content = std::fs::read_to_string(&read_path)
@@ -495,7 +504,7 @@ impl Settings {
                         "Failed to parse {} (using defaults): {e:#}",
                         read_path.display()
                     );
-                    return Ok(Self::default());
+                    Self::default()
                 }
             };
             s.default_mode = normalize_mode(&s.default_mode).to_string();
@@ -532,7 +541,6 @@ impl Settings {
             s
         };
         migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
-        settings.apply_env_overrides();
         Ok(settings)
     }
 

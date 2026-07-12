@@ -114,9 +114,14 @@ pub(crate) fn render_underwater_surface(
     Block::default()
         .style(Style::default().bg(palette::WHALE_BG))
         .render(area, buf);
+    // Ratatui clips long block titles at the border edge without signalling
+    // that anything is missing. Reserve the corner cells and semantic-ellipsis
+    // the title so compact terminals still read as intentional instruments.
+    let title_width = usize::from(surface.width.saturating_sub(4));
+    let title = crate::tui::ui_text::semantic_truncate(&title.into(), title_width);
     let block = Block::default()
         .title(Line::from(Span::styled(
-            format!(" {} ", title.into()),
+            format!(" {title} "),
             Style::default()
                 .fg(palette::WHALE_ACCENT_PRIMARY)
                 .add_modifier(Modifier::BOLD),
@@ -1130,8 +1135,11 @@ pub struct ConfigView {
     status: Option<String>,
     locale: Locale,
     effective_cost_currency: String,
+    effective_low_motion: bool,
+    effective_fancy_animations: bool,
     last_visible_rows: Cell<usize>,
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
+    last_mouse_selected: Option<usize>,
 }
 
 const CONFIG_MIN_KEY_COLUMN_WIDTH: usize = 19;
@@ -1143,7 +1151,7 @@ const CONFIG_COLUMN_GAPS_WIDTH: usize = 2;
 
 impl ConfigView {
     pub fn new_for_app(app: &App) -> Self {
-        let settings = Settings::load().unwrap_or_else(|_| Settings::default());
+        let settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
         let config = Config::load(app.config_path.clone(), app.config_profile.as_deref())
             .unwrap_or_default();
         let mut rows = vec![
@@ -1467,8 +1475,11 @@ impl ConfigView {
             status: None,
             locale: app.ui_locale,
             effective_cost_currency: cost_currency_config_value(app),
+            effective_low_motion: app.low_motion,
+            effective_fancy_animations: app.fancy_animations,
             last_visible_rows: Cell::new(0),
             last_row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
         }
     }
 
@@ -1813,6 +1824,22 @@ impl ConfigView {
                         .replace("{currency}", &self.effective_cost_currency)
                 );
             }
+        }
+
+        let runtime_value = match row.key.as_str() {
+            "low_motion" => Some(self.effective_low_motion),
+            "fancy_animations" => Some(self.effective_fancy_animations),
+            _ => None,
+        };
+        if let Some(runtime_value) = runtime_value
+            && row.value.parse::<bool>().ok() != Some(runtime_value)
+        {
+            return format!(
+                "{}{}",
+                row.value,
+                self.tr(MessageId::ConfigRowEffective)
+                    .replace("{currency}", &runtime_value.to_string())
+            );
         }
 
         row.value.clone()
@@ -2217,9 +2244,14 @@ impl ModalView for ConfigView {
             .iter()
             .find_map(|(y, row_idx)| (*y == mouse.row).then_some(*row_idx));
         if let Some(row_idx) = selected {
+            let activate = self.last_mouse_selected == Some(row_idx) && self.selected == row_idx;
             self.selected = row_idx;
             self.status = None;
             self.adjust_scroll(self.visible_rows_cached());
+            self.last_mouse_selected = Some(row_idx);
+            if activate && self.rows.get(row_idx).is_some_and(|row| row.editable) {
+                self.start_edit();
+            }
         }
         ViewAction::None
     }
@@ -2304,8 +2336,9 @@ impl ModalView for ConfigView {
                 self.filter.clone()
             };
 
+            let table_width = usize::from(inner.width).saturating_sub(usize::from(scrollable));
             let (key_column_width, value_column_width, scope_column_width) =
-                self.table_column_widths(usize::from(inner.width));
+                self.table_column_widths(table_width);
             let mut lines: Vec<Line> = vec![
                 Line::from(vec![
                     Span::styled(
@@ -2999,7 +3032,7 @@ mod tests {
     use super::{
         ActionHint, ConfigListItem, ConfigView, EmptyState, HelpView, ListDetailLayout, ModalKind,
         ModalView, ViewAction, ViewEvent, ViewStack, action_footer_lines, centered_modal_area,
-        render_modal_footer, subagent_view_agents, truncate_view_text,
+        render_modal_footer, render_underwater_surface, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::{Locale, MessageId, tr};
@@ -3433,6 +3466,20 @@ mod tests {
         assert_eq!(truncate_view_text(text, 3), "abc");
         assert_eq!(truncate_view_text(text, 4), "abc😀");
         assert_eq!(truncate_view_text(text, 5), "abc😀é");
+    }
+
+    #[test]
+    fn underwater_surface_ellipsizes_narrow_titles() {
+        let area = Rect::new(0, 0, 24, 8);
+        let mut buf = Buffer::empty(area);
+        render_underwater_surface(area, &mut buf, "Help — Concepts, commands, and keybindings");
+        let top = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(
+            top.contains('…'),
+            "narrow title should signal truncation: {top}"
+        );
     }
 
     #[test]
@@ -4093,6 +4140,18 @@ base_url = "https://api.xiaomimimo.com/v1"
 
         assert!(matches!(action, ViewAction::None));
         assert_eq!(view.selected, row_idx);
+
+        let second = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(second, ViewAction::None));
+        assert!(
+            view.editing.is_some(),
+            "second click should activate editing"
+        );
     }
 
     #[test]

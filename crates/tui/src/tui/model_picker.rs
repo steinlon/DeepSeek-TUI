@@ -8,13 +8,15 @@
 //! On apply we emit a [`ViewEvent::ModelPickerApplied`] with the resolved
 //! model id and effort tier.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Widget},
+    widgets::{Block, Paragraph, Widget},
 };
 
 use codewhale_config::catalog::CatalogSource;
@@ -37,6 +39,7 @@ use crate::provider_lake::{
 use crate::tui::app::{App, ReasoningEffort};
 use crate::tui::views::{
     ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    render_underwater_surface,
 };
 
 /// Thinking-effort rows shown for DeepSeek-style providers, in the order
@@ -138,6 +141,13 @@ enum Pane {
     Effort,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PaneRenderState {
+    pane: Pane,
+    selected: usize,
+    focused: bool,
+}
+
 pub struct ModelPickerView {
     initial_model: String,
     /// Exact runtime value before the picker opened. Keep this raw so choosing
@@ -168,6 +178,8 @@ pub struct ModelPickerView {
     /// Vllm) don't qualify just because routing to them doesn't require a
     /// key.
     configured_providers: Vec<ApiProvider>,
+    row_hitboxes: RefCell<Vec<(Rect, Pane, usize)>>,
+    last_mouse_selected: Option<(Pane, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +270,8 @@ impl ModelPickerView {
             model_rows,
             view: ModelListView::Configured,
             configured_providers,
+            row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
         };
         view.restore_memory(app.model_picker_memory.as_ref());
         view
@@ -536,11 +550,10 @@ impl ModelPickerView {
         buf: &mut Buffer,
         title: &str,
         rows: Vec<(String, String)>,
-        selected: usize,
-        focused: bool,
+        state: PaneRenderState,
     ) {
         let visible_height = usize::from(area.height.saturating_sub(1));
-        let (start, end) = visible_row_window(selected, rows.len(), visible_height);
+        let (start, end) = visible_row_window(state.selected, rows.len(), visible_height);
         let title = if rows.len() > visible_height && visible_height > 0 {
             if start + 1 == end {
                 // A scrollable pane whose visible window spans exactly one row
@@ -559,13 +572,13 @@ impl ModelPickerView {
         let title_area = Rect { height: 1, ..area };
         Paragraph::new(Line::from(vec![
             Span::styled(
-                if focused { "▸ " } else { "  " },
+                if state.focused { "▸ " } else { "  " },
                 Style::default().fg(palette::WHALE_INFO),
             ),
             Span::styled(
                 title,
                 Style::default()
-                    .fg(if focused {
+                    .fg(if state.focused {
                         palette::WHALE_INFO
                     } else {
                         palette::TEXT_PRIMARY
@@ -582,7 +595,13 @@ impl ModelPickerView {
 
         let mut lines = Vec::with_capacity(end.saturating_sub(start));
         for (idx, (label, hint)) in rows.iter().enumerate().skip(start).take(end - start) {
-            let is_selected = idx == selected;
+            let row_y = inner.y.saturating_add(lines.len() as u16);
+            self.row_hitboxes.borrow_mut().push((
+                Rect::new(inner.x, row_y, inner.width, 1),
+                state.pane,
+                idx,
+            ));
+            let is_selected = idx == state.selected;
             let marker = if is_selected { "▸" } else { " " };
             let label_style = if is_selected {
                 Style::default()
@@ -1418,12 +1437,51 @@ impl ModalView for ModelPickerView {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                self.last_mouse_selected = None;
                 self.move_up();
                 ViewAction::None
             }
             MouseEventKind::ScrollDown => {
+                self.last_mouse_selected = None;
                 self.move_down();
                 ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self
+                    .row_hitboxes
+                    .borrow()
+                    .iter()
+                    .find_map(|(rect, pane, idx)| {
+                        rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                            .then_some((*pane, *idx))
+                    });
+                let Some((pane, idx)) = clicked else {
+                    return ViewAction::None;
+                };
+                let apply = self.last_mouse_selected == Some((pane, idx))
+                    && self.focus == pane
+                    && match pane {
+                        Pane::Model => self.selected_model_idx == idx,
+                        Pane::Effort => self.selected_effort_idx == idx,
+                    };
+                self.focus = pane;
+                match pane {
+                    Pane::Model => {
+                        let effort = self.resolved_effort();
+                        self.selected_model_idx = idx.min(self.model_row_count().saturating_sub(1));
+                        self.select_effort_for_current_model(effort);
+                    }
+                    Pane::Effort => {
+                        self.selected_effort_idx =
+                            idx.min(self.current_efforts().len().saturating_sub(1));
+                    }
+                }
+                self.last_mouse_selected = Some((pane, idx));
+                if apply {
+                    ViewAction::EmitAndClose(self.build_event())
+                } else {
+                    ViewAction::None
+                }
             }
             _ => ViewAction::None,
         }
@@ -1436,10 +1494,9 @@ impl ModalView for ModelPickerView {
 
 impl ModelPickerView {
     fn render_route(&self, area: Rect, buf: &mut Buffer) {
-        Clear.render(area, buf);
-        Block::default()
-            .style(Style::default().bg(palette::WHALE_BG))
-            .render(area, buf);
+        self.row_hitboxes.borrow_mut().clear();
+        let inner =
+            render_underwater_surface(area, buf, format!("route · {}", self.view.title_label()));
 
         // Say what the action does in model language. Provider changes are an
         // implementation detail of applying a cross-provider model row.
@@ -1448,7 +1505,7 @@ impl ModelPickerView {
             other => other.next().title_label(),
         };
         let content = render_modal_footer(
-            area,
+            inner,
             buf,
             &[
                 ActionHint::new("↑↓", "move"),
@@ -1542,8 +1599,11 @@ impl ModelPickerView {
             buf,
             &model_title,
             model_rows,
-            self.selected_model_idx,
-            self.focus == Pane::Model,
+            PaneRenderState {
+                pane: Pane::Model,
+                selected: self.selected_model_idx,
+                focused: self.focus == Pane::Model,
+            },
         );
 
         let effort_provider = self.resolved_provider().unwrap_or(self.initial_provider);
@@ -1579,8 +1639,11 @@ impl ModelPickerView {
             buf,
             "Thinking",
             effort_rows,
-            selected_effort_idx,
-            self.focus == Pane::Effort,
+            PaneRenderState {
+                pane: Pane::Effort,
+                selected: selected_effort_idx,
+                focused: self.focus == Pane::Effort,
+            },
         );
     }
 }
@@ -2984,6 +3047,36 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_focuses_row_and_second_click_applies() {
+        let (app, config, _lock) = create_test_app();
+        let mut view = ModelPickerView::new(&app, &config);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let (rect, pane, idx) = view
+            .row_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, pane, idx)| *pane == Pane::Effort && *idx == 0)
+            .copied()
+            .expect("first effort row should be clickable");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(matches!(view.handle_mouse(click), ViewAction::None));
+        assert_eq!(view.focus, pane);
+        assert_eq!(view.selected_effort_idx, idx);
+        assert!(matches!(
+            view.handle_mouse(click),
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied { .. })
+        ));
+    }
+
+    #[test]
     fn tab_switches_between_model_and_thinking() {
         let (app, config, _lock) = create_test_app();
         let mut view = ModelPickerView::new(&app, &config);
@@ -3387,7 +3480,17 @@ mod tests {
             .collect();
         let area = Rect::new(0, 0, 40, 2);
         let mut buf = Buffer::empty(area);
-        view.render_pane(area, &mut buf, "Model", rows, 1, false);
+        view.render_pane(
+            area,
+            &mut buf,
+            "Model",
+            rows,
+            PaneRenderState {
+                pane: Pane::Model,
+                selected: 1,
+                focused: false,
+            },
+        );
 
         let title = buffer_row_text(&buf, area, area.y);
         assert!(
@@ -3412,7 +3515,17 @@ mod tests {
             .collect();
         let area = Rect::new(0, 0, 40, 3);
         let mut buf = Buffer::empty(area);
-        view.render_pane(area, &mut buf, "Thinking", rows, 2, false);
+        view.render_pane(
+            area,
+            &mut buf,
+            "Thinking",
+            rows,
+            PaneRenderState {
+                pane: Pane::Effort,
+                selected: 2,
+                focused: false,
+            },
+        );
 
         let title = buffer_row_text(&buf, area, area.y);
         assert!(
