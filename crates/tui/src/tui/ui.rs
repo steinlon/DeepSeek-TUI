@@ -3001,11 +3001,8 @@ async fn run_event_loop(
                         recoverable: _,
                     } => {
                         let provider_before_error = app.api_provider;
-                        let (health_provider, health_model) = app
-                            .pending_turn_route
-                            .as_ref()
-                            .map(|(provider, model, _)| (*provider, model.clone()))
-                            .unwrap_or_else(|| (provider_before_error, app.model.clone()));
+                        let (health_provider, health_model) =
+                            error_health_route(app, provider_before_error);
                         app.provider_health.record_failure(
                             config,
                             health_provider,
@@ -6778,6 +6775,19 @@ fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) {
         });
         app.pending_turn_route = None;
     }
+}
+
+fn error_health_route(app: &App, fallback_provider: ApiProvider) -> (ApiProvider, String) {
+    app.active_turn
+        .as_ref()
+        .and_then(|turn| turn.route.as_ref())
+        .map(|route| (route.provider, route.model.clone()))
+        .or_else(|| {
+            app.pending_turn_route
+                .as_ref()
+                .map(|(provider, model, _)| (*provider, model.clone()))
+        })
+        .unwrap_or_else(|| (fallback_provider, app.model.clone()))
 }
 
 fn record_turn_activity(app: &mut App, event: &EngineEvent, now: Instant) {

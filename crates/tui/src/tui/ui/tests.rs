@@ -7235,6 +7235,27 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
 }
 
 #[test]
+fn engine_error_health_accounting_uses_active_turn_route() {
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = "current-model".to_string();
+    let event = EngineEvent::TurnStarted {
+        turn_id: "routed-turn".to_string(),
+        created_at: chrono::Utc::now(),
+        route: Some(crate::core::events::TurnRoute {
+            provider: ApiProvider::Openai,
+            model: "gpt-5.5".to_string(),
+            auto_model: true,
+        }),
+    };
+    capture_turn_started_metadata(&mut app, &event);
+
+    let route = error_health_route(&app, app.api_provider);
+
+    assert_eq!(route, (ApiProvider::Openai, "gpt-5.5".to_string()));
+}
+
+#[test]
 fn completion_only_hook_metadata_is_synthetic_and_non_model() {
     let observed_after = chrono::Utc::now();
     let first = turn_end_observer_metadata(None);
