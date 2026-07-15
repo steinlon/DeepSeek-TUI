@@ -54,6 +54,10 @@ quieter, docs-first community foundation.
 - Keep the opt-in `remember` tool in the model-visible first-turn catalog so
   durable preference capture works without requiring a model to discover a
   tool it cannot yet know exists (#4373 by @Angel-Hair).
+- Make `review` handle a staged snapshot relative to a base ref by comparing
+  the branch merge-base tree with the index. This preserves committed and
+  staged branch work, excludes unstaged edits, and avoids the invalid
+  `git diff --cached <base>...HEAD` form.
 - Honor each MCP server's advertised discovery capabilities before calling
   optional tools, resources, templates, or prompts; keep optional probes
   independently bounded and fail-soft (#4308 by @nsfoxer).
