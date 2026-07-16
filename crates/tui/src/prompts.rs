@@ -315,7 +315,7 @@ fn load_handoff_block(workspace: &Path) -> Option<String> {
 
 /// Load the structured user-global constitution, if present, and render it as
 /// its own model-facing block.
-fn load_user_constitution_block() -> Option<String> {
+pub(crate) fn load_user_constitution_block() -> Option<String> {
     if user_constitution_disabled_by_setup_state() {
         return None;
     }
@@ -1061,7 +1061,14 @@ pub(crate) fn compose_prompt_with_approval_model_and_shell(
     )
 }
 
-fn compose_default_static_layers(_personality: Personality, model_id: &str) -> String {
+pub(crate) fn compose_default_static_layers(_personality: Personality, model_id: &str) -> String {
+    compose_default_static_layers_with_context(model_id, None)
+}
+
+fn compose_default_static_layers_with_context(
+    model_id: &str,
+    context_window_override: Option<u32>,
+) -> String {
     // Personality is folded into the constitutional preamble/articles — no
     // separate overlay is appended. Language and output rules are split into
     // their own static segments so the 0.9.0 constitution stays compact.
@@ -1071,7 +1078,7 @@ fn compose_default_static_layers(_personality: Personality, model_id: &str) -> S
         LANGUAGE_PROMPT.trim(),
         OUTPUT_PROMPT.trim()
     );
-    apply_model_template(&layers, model_id, None)
+    apply_model_template(&layers, model_id, context_window_override)
 }
 
 fn apply_static_prompt_composer(
@@ -1170,8 +1177,7 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     instructions: Option<&[InstructionSource]>,
     session_context: PromptSessionContext<'_>,
 ) -> SystemPrompt {
-    let default_layers = apply_model_template(
-        effective_base_prompt().trim(),
+    let default_layers = compose_default_static_layers_with_context(
         session_context.model_id,
         session_context.context_window_override,
     );
@@ -3143,6 +3149,35 @@ mod tests {
         assert!(prompt.contains("## Output Formatting"));
         assert!(prompt.contains("terminal, not a browser"));
         assert!(prompt.contains("Markdown tables almost never render correctly"));
+    }
+
+    #[test]
+    fn runtime_prompt_assembly_preserves_split_static_layers() {
+        let tmp = tempdir().expect("tempdir");
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "glm-5.2",
+                    context_window_override: Some(1_000_000),
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
+
+        assert!(prompt.contains("## Codewhale"));
+        assert!(prompt.contains("## Language"));
+        assert!(prompt.contains("## Output Formatting"));
+        assert!(prompt.contains("Use the `lang` field only when"));
     }
 
     #[test]

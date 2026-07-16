@@ -19,6 +19,12 @@ largest curated model-and-pricing expansion in the project so far.
 
 ### Fixed — final integration
 
+- Redact configured, environment, file-backed, and bare active credentials
+  from every tool result before it crosses any model-provider wire protocol;
+  retrieved spillover content is sanitized again at that boundary. The
+  `read_file` tool also refuses CodeWhale configuration, backup, and
+  credential-store paths, preventing routine tool use from exposing those
+  local files.
 - Keep immediate TUI submit failures inside the shell: custom-provider route
   preflight and closed-mailbox errors now restore the exact composer draft and
   selected skill for retry, with a sticky visible error instead of exiting.

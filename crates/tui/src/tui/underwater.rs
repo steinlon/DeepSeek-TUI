@@ -633,6 +633,13 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
 
     let (effective_provider, effective_model) = app.effective_route_identity_display();
     let route_label = format!("{effective_provider} · {effective_model}");
+    let status_indicator = crate::tui::widgets::header_status_indicator_frame(
+        (!app.low_motion && app.fancy_animations)
+            .then_some(app.turn_started_at)
+            .flatten(),
+        &app.status_indicator,
+    )
+    .filter(|indicator| *indicator != "cw");
     let mut left = vec![
         Span::styled(
             "cw",
@@ -652,27 +659,17 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
             }),
         ),
     ];
-    if tier != ShellTier::Compact {
-        // The Underwater shell owns its header rather than delegating to the
-        // classic renderer, so render the selected status mark here too.
-        // "cw" is already the leading brand mark; the other choices deserve
-        // their visible indicator beside it.
-        if let Some(indicator) = crate::tui::widgets::header_status_indicator_frame(
-            (!app.low_motion && app.fancy_animations)
-                .then_some(app.turn_started_at)
-                .flatten(),
-            &app.status_indicator,
-        )
-        .filter(|indicator| *indicator != "cw")
-        {
-            left.push(Span::raw(" "));
-            left.push(Span::styled(
-                indicator,
-                Style::default()
-                    .fg(app.ui_theme.info)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
+    // The selected brand/status mark is part of the user's chosen header,
+    // not expendable wide-screen decoration. Keep it in compact layouts too;
+    // route text truncates before the permission posture or selected mark.
+    if let Some(indicator) = status_indicator {
+        left.push(Span::raw(" "));
+        left.push(Span::styled(
+            indicator,
+            Style::default()
+                .fg(app.ui_theme.info)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     // Permission is safety state, not optional chrome. Compact terminals shed
     // the status mark and context meter, but keep the effective posture.
@@ -724,21 +721,31 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
             Span::styled(permission, Style::default().fg(app.ui_theme.text_muted)),
         ];
-        let fixed_width = 4usize.saturating_add(span_width(&suffix));
+        let indicator_width = status_indicator.map_or(0, |indicator| 1 + indicator.width());
+        let fixed_width = 4usize
+            .saturating_add(indicator_width)
+            .saturating_add(span_width(&suffix));
         let model_budget = left_budget.saturating_sub(fixed_width);
-        left = vec![
-            Span::styled(
-                "cw",
+        left = vec![Span::styled(
+            "cw",
+            Style::default()
+                .fg(app.ui_theme.accent_primary)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if let Some(indicator) = status_indicator {
+            left.push(Span::raw(" "));
+            left.push(Span::styled(
+                indicator,
                 Style::default()
-                    .fg(app.ui_theme.accent_primary)
+                    .fg(app.ui_theme.info)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                truncate_to_width(&app.model_display_label(), model_budget),
-                Style::default().fg(app.ui_theme.text_muted),
-            ),
-        ];
+            ));
+        }
+        left.push(Span::raw("  "));
+        left.push(Span::styled(
+            truncate_to_width(&app.model_display_label(), model_budget),
+            Style::default().fg(app.ui_theme.text_muted),
+        ));
         left.extend(suffix);
     }
     let left_width = span_width(&left);
@@ -1049,6 +1056,17 @@ mod tests {
             header.contains("Full Access"),
             "permission posture missing: {header:?}"
         );
+    }
+
+    #[test]
+    fn compact_header_keeps_the_selected_whale_indicator() {
+        let mut app = test_app();
+        app.status_indicator = "whale".to_string();
+        app.model = "provider/model-with-a-deliberately-long-route-name".to_string();
+
+        let header = header_text(&app, 40);
+
+        assert!(header.contains('🐳'), "selected whale missing: {header:?}");
     }
 
     #[test]

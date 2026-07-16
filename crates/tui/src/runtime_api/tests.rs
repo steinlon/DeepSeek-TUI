@@ -4496,6 +4496,76 @@ async fn reload_config_reads_from_config_path_and_updates_in_memory_state() -> R
 }
 
 #[tokio::test]
+async fn zai_model_update_is_provider_scoped_and_preserves_deepseek_fallback() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-config-zai-model-scope-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "zai"
+default_text_model = "deepseek-v4-pro"
+
+[providers.zai]
+api_key = "zai-test-key"
+model = "GLM-5.2"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let response = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let before = get_config(&client, &addr).await;
+    assert_eq!(before["provider"], "zai");
+    assert_eq!(before["model"], "GLM-5.2");
+    assert_eq!(before["default_model"], "deepseek-v4-pro");
+
+    let (status, body) = post_set_config(&client, &addr, "model", "glm-5-turbo", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["value"], "GLM-5-Turbo");
+
+    let persisted = fs::read_to_string(&config_file)?;
+    let persisted: toml::Value = toml::from_str(&persisted)?;
+    assert_eq!(
+        persisted["default_text_model"].as_str(),
+        Some("deepseek-v4-pro"),
+        "the active Z.ai model must not overwrite the DeepSeek fallback"
+    );
+    assert_eq!(
+        persisted["providers"]["zai"]["model"].as_str(),
+        Some("GLM-5-Turbo")
+    );
+
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-flash", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    let response = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after = get_config(&client, &addr).await;
+    assert_eq!(after["provider"], "zai");
+    assert_eq!(after["model"], "GLM-5-Turbo");
+    assert_eq!(after["default_model"], "deepseek-v4-pro");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn reload_config_preserves_profile_selected_named_custom_route() -> Result<()> {
     let root = std::env::temp_dir().join(format!(
         "codewhale-config-reload-profile-{}",
@@ -4636,7 +4706,7 @@ async fn set_config_with_persist_false_does_not_write_to_disk() -> Result<()> {
     };
     let client = crate::tls::reqwest_client();
 
-    let (status, body) = post_set_config(&client, &addr, "model", "some-model", false).await;
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-flash", false).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -4918,7 +4988,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     let client = crate::tls::reqwest_client();
 
     // persist:true → persisted=true, requires_reload=true
-    let (status, body) = post_set_config(&client, &addr, "model", "shape-test-model", true).await;
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-flash", true).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["key"].as_str(),
@@ -4927,7 +4997,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     );
     assert_eq!(
         body["value"].as_str(),
-        Some("shape-test-model"),
+        Some("deepseek-v4-flash"),
         "value field, body: {body}"
     );
     assert!(
@@ -4946,7 +5016,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     );
 
     // persist:false → persisted=false, requires_reload=false
-    let (status, body) = post_set_config(&client, &addr, "model", "another-model", false).await;
+    let (status, body) = post_set_config(&client, &addr, "model", "deepseek-v4-pro", false).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["key"].as_str(),
@@ -4955,7 +5025,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     );
     assert_eq!(
         body["value"].as_str(),
-        Some("another-model"),
+        Some("deepseek-v4-pro"),
         "value field, body: {body}"
     );
     assert_eq!(

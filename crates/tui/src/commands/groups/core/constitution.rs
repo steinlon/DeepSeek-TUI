@@ -229,7 +229,7 @@ fn format_status(app: &App, locale: Locale) -> String {
         out,
         "- {}: {}",
         copy.validity_label,
-        validity_label(load.validity_for_display(state.as_ref()), locale)
+        manager_validity_label(&load, state.as_ref(), locale)
     );
     let _ = writeln!(
         out,
@@ -520,6 +520,22 @@ fn validity_label(validity: ConstitutionValidity, locale: Locale) -> &'static st
         (_, ConstitutionValidity::Empty) => "empty",
         (_, ConstitutionValidity::Unreadable) => "unreadable",
     }
+}
+
+fn manager_validity_label(
+    load: &UserConstitutionStatus,
+    state: Option<&SetupState>,
+    locale: Locale,
+) -> String {
+    if matches!(load, UserConstitutionStatus::Missing { .. })
+        && state.is_some_and(|state| state.constitution_choice == ConstitutionChoice::Bundled)
+    {
+        return match locale {
+            Locale::ZhHans => "不适用（已选择内置/默认；没有自定义文件）".to_string(),
+            _ => "not applicable (bundled/default selected; no custom file)".to_string(),
+        };
+    }
+    validity_label(load.validity_for_display(state), locale).to_string()
 }
 
 fn posture_label(source: RuntimePostureSource, locale: Locale) -> &'static str {
@@ -833,7 +849,7 @@ impl ConstitutionManagerCopy {
                 language_label: "语言",
                 last_preview_label: "上次接受的预览",
                 runtime_posture_label: "运行时姿态",
-                checkpoint_label: "检查点",
+                checkpoint_label: "准则检查点代次",
                 preview_header: "预览",
                 preview_action: "/constitution preview 会在存在时打开精确渲染的用户全局块。",
                 repo_action: "/constitution repo 会在存在时显示 .codewhale/constitution.json 本地准则。",
@@ -877,7 +893,7 @@ impl ConstitutionManagerCopy {
                 language_label: "Language",
                 last_preview_label: "Last accepted preview",
                 runtime_posture_label: "Runtime posture",
-                checkpoint_label: "Checkpoint",
+                checkpoint_label: "Constitution checkpoint generation",
                 preview_header: "Preview",
                 preview_action: "/constitution preview opens the exact rendered user-global block when present.",
                 repo_action: "/constitution repo shows .codewhale/constitution.json local law when present.",
@@ -917,9 +933,9 @@ impl ConstitutionManagerCopy {
 
     fn completed_for(&self, version: &str) -> String {
         if self.manager_header == "协作准则管理器" {
-            format!("已完成 {version}")
+            format!("当前（自 {version} 引入）")
         } else {
-            format!("completed for {version}")
+            format!("current (introduced in {version})")
         }
     }
 }

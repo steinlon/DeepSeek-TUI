@@ -165,6 +165,11 @@ pub struct SpeechSynthesisResponse {
 pub struct DeepSeekClient {
     pub(super) http_client: reqwest::Client,
     api_key: String,
+    /// Exact configured credential values removed from model-bound tool
+    /// results. Structural redaction handles config/JSON assignments, while
+    /// this list closes the gap for bare provider tokens with no recognizable
+    /// prefix (for example token-plan and provider-specific keys).
+    model_bound_secret_values: Arc<Vec<String>>,
     pub(super) base_url: String,
     pub(super) api_provider: ApiProvider,
     retry: RetryPolicy,
@@ -387,6 +392,7 @@ impl Clone for DeepSeekClient {
         Self {
             http_client: self.http_client.clone(),
             api_key: self.api_key.clone(),
+            model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             base_url: self.base_url.clone(),
             api_provider: self.api_provider,
             retry: self.retry.clone(),
@@ -399,6 +405,158 @@ impl Clone for DeepSeekClient {
             stream_idle_timeout: self.stream_idle_timeout,
         }
     }
+}
+
+const MIN_EXACT_SECRET_CHARS: usize = 8;
+
+fn push_model_bound_secret(values: &mut Vec<String>, value: Option<&str>) {
+    let Some(value) = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() >= MIN_EXACT_SECRET_CHARS)
+    else {
+        return;
+    };
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
+}
+
+fn model_bound_secret_store_slot(provider: ApiProvider) -> Option<&'static str> {
+    match provider {
+        ApiProvider::DeepseekCN => Some("deepseek"),
+        ApiProvider::SiliconflowCn => Some("siliconflow"),
+        ApiProvider::Custom => None,
+        _ => Some(provider.as_str()),
+    }
+}
+
+fn push_file_backed_model_bound_secrets(values: &mut Vec<String>) {
+    // Unit tests must never inspect the developer's real credential store.
+    // The isolated regression below opts in with a temporary CODEWHALE_HOME,
+    // matching Config's existing secret-store test discipline.
+    #[cfg(test)]
+    if std::env::var_os("CODEWHALE_HOME").is_none()
+        || std::env::var_os("CODEWHALE_SECRET_BACKEND").is_none()
+    {
+        return;
+    }
+
+    // Read the file backend directly. `Secrets::auto_detect()` could select
+    // the opt-in OS keychain, where probing every inactive provider would
+    // cause a burst of user-visible credential prompts. The active credential
+    // is already covered by `deepseek_api_key()` regardless of backend.
+    let secrets = codewhale_secrets::Secrets::file_backed();
+    let mut slots = Vec::new();
+    for provider in ApiProvider::all()
+        .iter()
+        .copied()
+        .chain(std::iter::once(ApiProvider::DeepseekCN))
+    {
+        let Some(slot) = model_bound_secret_store_slot(provider) else {
+            continue;
+        };
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+    }
+    // The legacy literal `provider = "custom"` route owns this durable slot.
+    slots.push("custom");
+
+    for slot in slots {
+        if let Ok(Some(secret)) = secrets.get(slot) {
+            push_model_bound_secret(values, Some(&secret));
+        }
+    }
+}
+
+fn configured_model_bound_secret_values(config: &Config, active_api_key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    push_model_bound_secret(&mut values, Some(active_api_key));
+    push_model_bound_secret(&mut values, config.api_key.as_deref());
+    push_model_bound_secret(&mut values, config.sandbox_api_key.as_deref());
+    push_model_bound_secret(
+        &mut values,
+        config
+            .search
+            .as_ref()
+            .and_then(|search| search.api_key.as_deref()),
+    );
+    push_model_bound_secret(
+        &mut values,
+        config
+            .vision_model
+            .as_ref()
+            .and_then(|vision| vision.api_key.as_deref()),
+    );
+
+    if let Some(headers) = config.http_headers.as_ref() {
+        for (name, value) in headers {
+            if is_upstream_auth_header(name) {
+                push_model_bound_secret(&mut values, Some(value));
+            }
+        }
+    }
+
+    for provider in ApiProvider::all()
+        .iter()
+        .copied()
+        .chain(std::iter::once(ApiProvider::DeepseekCN))
+        .filter(|provider| *provider != ApiProvider::Custom)
+    {
+        for env_name in provider.env_vars() {
+            if let Ok(value) = std::env::var(env_name) {
+                push_model_bound_secret(&mut values, Some(&value));
+            }
+        }
+        let Some(provider_config) = config.provider_config_for(provider) else {
+            continue;
+        };
+        push_model_bound_secret(&mut values, provider_config.api_key.as_deref());
+        if let Some(headers) = provider_config.http_headers.as_ref() {
+            for (name, value) in headers {
+                if is_upstream_auth_header(name) {
+                    push_model_bound_secret(&mut values, Some(value));
+                }
+            }
+        }
+    }
+
+    if let Some(providers) = config.providers.as_ref() {
+        for provider_config in providers.custom.values() {
+            push_model_bound_secret(&mut values, provider_config.api_key.as_deref());
+            if let Some(env_name) = provider_config
+                .api_key_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                && let Ok(value) = std::env::var(env_name)
+            {
+                push_model_bound_secret(&mut values, Some(&value));
+            }
+            if let Some(headers) = provider_config.http_headers.as_ref() {
+                for (name, value) in headers {
+                    if is_upstream_auth_header(name) {
+                        push_model_bound_secret(&mut values, Some(value));
+                    }
+                }
+            }
+        }
+    }
+
+    push_file_backed_model_bound_secrets(&mut values);
+
+    // Replace longer values first in case one credential happens to contain
+    // another as a prefix.
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
+fn redact_model_bound_text(text: &str, exact_secret_values: &[String]) -> String {
+    let mut redacted = text.to_string();
+    for secret in exact_secret_values {
+        redacted = redacted.replace(secret, codewhale_config::persistence::REDACTED);
+    }
+    codewhale_config::persistence::redact_secrets(&redacted)
 }
 
 // === Helpers ===
@@ -730,6 +888,8 @@ impl DeepSeekClient {
     /// timeouts) is derived from `config` so the two paths cannot drift.
     fn from_parts(base_url: String, default_model: String, config: &Config) -> Result<Self> {
         let api_key = config.deepseek_api_key()?;
+        let model_bound_secret_values =
+            Arc::new(configured_model_bound_secret_values(config, &api_key));
         let api_provider = config.api_provider();
         validate_base_url_security(&base_url)?;
         let retry = config.retry_policy();
@@ -792,6 +952,7 @@ impl DeepSeekClient {
         Ok(Self {
             http_client,
             api_key,
+            model_bound_secret_values,
             base_url,
             api_provider,
             retry,
@@ -803,6 +964,26 @@ impl DeepSeekClient {
             reasoning_stream_style,
             stream_idle_timeout,
         })
+    }
+
+    /// Return a request whose tool results are safe to send to an upstream
+    /// model provider.
+    ///
+    /// Tool output is untrusted model-bound data: it can contain a whole
+    /// config file, a bare credential emitted by a shell command, or a
+    /// spillover receipt whose backing content is later persisted by the chat
+    /// adapter. Keep this boundary above all protocol adapters so Chat,
+    /// Anthropic Messages, and OpenAI Responses — streaming and non-streaming
+    /// alike — receive the same sanitized payload.
+    fn prepare_model_bound_request(&self, mut request: MessageRequest) -> MessageRequest {
+        for message in &mut request.messages {
+            for block in &mut message.content {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    *content = redact_model_bound_text(content, &self.model_bound_secret_values);
+                }
+            }
+        }
+        request
     }
 
     #[cfg(test)]
@@ -1703,6 +1884,7 @@ impl LlmClient for DeepSeekClient {
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
         let _permit = self.acquire_provider_request_permit().await;
+        let request = self.prepare_model_bound_request(request);
         if self.api_provider == ApiProvider::OpenaiCodex {
             return self.handle_responses_message(request).await;
         }
@@ -1717,6 +1899,7 @@ impl LlmClient for DeepSeekClient {
         request: MessageRequest,
     ) -> Result<crate::llm_client::StreamEventBox> {
         let permit = self.acquire_provider_request_permit().await;
+        let request = self.prepare_model_bound_request(request);
         if self.api_provider == ApiProvider::OpenaiCodex {
             let stream = self.handle_responses_stream(request).await?;
             return Ok(Self::hold_provider_request_permit_for_stream(
@@ -2399,6 +2582,7 @@ mod tests {
         parse_chat_message, parse_sse_chunk, sanitize_thinking_mode_messages, tool_to_chat,
         tool_to_chat_for_base_url,
     };
+    use crate::client::responses::build_responses_body;
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::models::{
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
@@ -2422,6 +2606,366 @@ mod tests {
             strict: Some(true),
             cache_control: None,
         }
+    }
+
+    const CONFIG_SECRET_SENTINELS: [&str; 8] = [
+        "deepseek-config-secret-001",
+        "arcee-config-secret-002",
+        "moonshot-config-secret-003",
+        "openrouter-config-secret-004",
+        "together-config-secret-005",
+        "xiaomi-config-secret-006",
+        "zai-active-config-secret-007",
+        "sakana-config-secret-008",
+    ];
+
+    fn client_with_config_secret_sentinels() -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        DeepSeekClient::new(&Config {
+            provider: Some("zai".to_string()),
+            api_key: Some(CONFIG_SECRET_SENTINELS[0].to_string()),
+            providers: Some(ProvidersConfig {
+                arcee: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[1].to_string()),
+                    ..ProviderConfig::default()
+                },
+                moonshot: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[2].to_string()),
+                    ..ProviderConfig::default()
+                },
+                openrouter: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[3].to_string()),
+                    ..ProviderConfig::default()
+                },
+                together: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[4].to_string()),
+                    ..ProviderConfig::default()
+                },
+                xiaomi_mimo: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[5].to_string()),
+                    ..ProviderConfig::default()
+                },
+                zai: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[6].to_string()),
+                    ..ProviderConfig::default()
+                },
+                sakana: ProviderConfig {
+                    api_key: Some(CONFIG_SECRET_SENTINELS[7].to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("client with secret sentinels")
+    }
+
+    fn request_with_tool_result(content: impl Into<String>) -> MessageRequest {
+        MessageRequest {
+            model: "glm-5.2".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-secret-test".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "config.toml"}),
+                        caller: None,
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call-secret-test".to_string(),
+                        content: content.into(),
+                        is_error: None,
+                        content_blocks: None,
+                    }],
+                },
+            ],
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    fn tool_result_content(request: &MessageRequest) -> &str {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("tool result content")
+    }
+
+    #[test]
+    fn model_bound_request_redacts_configured_secrets_and_bare_active_key() {
+        let client = client_with_config_secret_sentinels();
+        let config_dump = format!(
+            "api_key = \"{}\"\n[providers.arcee]\napi_key = \"{}\"\n\
+             ordinary_setting = \"keep-me\"\nall bare values: {}",
+            CONFIG_SECRET_SENTINELS[0],
+            CONFIG_SECRET_SENTINELS[1],
+            CONFIG_SECRET_SENTINELS.join(" ")
+        );
+
+        let prepared = client.prepare_model_bound_request(request_with_tool_result(config_dump));
+        let content = tool_result_content(&prepared);
+
+        for secret in CONFIG_SECRET_SENTINELS {
+            assert!(!content.contains(secret), "secret survived redaction");
+        }
+        assert!(content.contains(codewhale_config::persistence::REDACTED));
+        assert!(content.contains("ordinary_setting"));
+        assert!(content.contains("keep-me"));
+    }
+
+    #[test]
+    fn model_bound_request_redacts_inactive_file_store_and_environment_secrets() {
+        const FILE_STORED_INACTIVE: &str = "inactive-arcee-file-secret-901";
+        const BUILTIN_ENV_SECRET: &str = "inactive-arcee-env-secret-902";
+        const CUSTOM_ENV_NAME: &str = "CW_TEST_CUSTOM_PROVIDER_API_KEY";
+        const CUSTOM_ENV_SECRET: &str = "inactive-custom-env-secret-903";
+
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let codewhale_home = tmp.path().join("codewhale-home");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("create isolated home");
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _secret_backend =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", &home);
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
+        let builtin_env_name = ApiProvider::Arcee
+            .env_vars()
+            .first()
+            .copied()
+            .expect("Arcee API-key environment variable");
+        let _builtin_env =
+            crate::test_support::EnvVarGuard::set(builtin_env_name, BUILTIN_ENV_SECRET);
+        let _custom_env = crate::test_support::EnvVarGuard::set(CUSTOM_ENV_NAME, CUSTOM_ENV_SECRET);
+
+        codewhale_secrets::Secrets::file_backed()
+            .set("arcee", FILE_STORED_INACTIVE)
+            .expect("write isolated inactive provider credential");
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = DeepSeekClient::new(&Config {
+            provider: Some("zai".to_string()),
+            providers: Some(ProvidersConfig {
+                zai: ProviderConfig {
+                    api_key: Some("active-zai-secret-900".to_string()),
+                    ..ProviderConfig::default()
+                },
+                custom: HashMap::from([(
+                    "example-custom".to_string(),
+                    ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        api_key_env: Some(CUSTOM_ENV_NAME.to_string()),
+                        ..ProviderConfig::default()
+                    },
+                )]),
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("client with inactive file-store credential");
+        let prepared = client.prepare_model_bound_request(request_with_tool_result(format!(
+            "retrieved values: {FILE_STORED_INACTIVE} {BUILTIN_ENV_SECRET} {CUSTOM_ENV_SECRET}\nordinary output survives"
+        )));
+        let content = tool_result_content(&prepared);
+
+        for secret in [FILE_STORED_INACTIVE, BUILTIN_ENV_SECRET, CUSTOM_ENV_SECRET] {
+            assert!(
+                !content.contains(secret),
+                "inactive secret survived: {secret}"
+            );
+        }
+        assert!(content.contains(codewhale_config::persistence::REDACTED));
+        assert!(content.contains("ordinary output survives"));
+    }
+
+    #[test]
+    fn model_bound_request_leaves_ordinary_tool_output_unchanged() {
+        let client = client_with_config_secret_sentinels();
+        let ordinary = "tests passed: 42\nREADME.md updated\n";
+        let prepared =
+            client.prepare_model_bound_request(request_with_tool_result(ordinary.to_string()));
+        assert_eq!(tool_result_content(&prepared), ordinary);
+    }
+
+    #[test]
+    fn short_chat_tool_payload_is_redacted_before_wire_serialization() {
+        let client = client_with_config_secret_sentinels();
+        let prepared = client.prepare_model_bound_request(request_with_tool_result(format!(
+            "active token: {}",
+            CONFIG_SECRET_SENTINELS[6]
+        )));
+        let wire = build_chat_messages_for_request(&prepared);
+        let serialized = serde_json::to_string(&wire).expect("serialize chat wire messages");
+
+        assert!(!serialized.contains(CONFIG_SECRET_SENTINELS[6]));
+        assert!(serialized.contains(codewhale_config::persistence::REDACTED));
+    }
+
+    #[test]
+    fn configured_secret_redaction_reaches_all_protocol_bodies() {
+        let client = client_with_config_secret_sentinels();
+        let prepared = client.prepare_model_bound_request(request_with_tool_result(format!(
+            "safe output then {}",
+            CONFIG_SECRET_SENTINELS[6]
+        )));
+
+        let chat = serde_json::to_string(&build_chat_messages_for_request(&prepared))
+            .expect("serialize Chat Completions body");
+        let anthropic = client.build_anthropic_body(&prepared, false).to_string();
+        let responses = build_responses_body(&prepared).to_string();
+
+        for (route, body) in [
+            ("chat", chat.as_str()),
+            ("anthropic", anthropic.as_str()),
+            ("responses", responses.as_str()),
+        ] {
+            assert!(
+                !body.contains(CONFIG_SECRET_SENTINELS[6]),
+                "{route} body retained the configured credential"
+            );
+            assert!(
+                body.contains(codewhale_config::persistence::REDACTED),
+                "{route} body lost the redaction marker"
+            );
+        }
+    }
+
+    // This test deliberately serializes access to process-global spillover
+    // state while awaiting the retrieval path.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn retrieved_turn_loop_spillover_is_sanitized_before_model_wire() {
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spillover_root = tmp.path().join(".codewhale").join("tool_outputs");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(spillover_root.clone()));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        let head = (0..40)
+            .map(|_| format!("{}\n", "safe-head".repeat(100)))
+            .collect::<String>();
+        let tail = (0..80)
+            .map(|_| format!("{}\n", "safe-tail".repeat(100)))
+            .collect::<String>();
+        let raw = format!("{head}\n{}\n{tail}", CONFIG_SECRET_SENTINELS[6]);
+        assert!(
+            raw.len() > crate::tools::truncate::SPILLOVER_THRESHOLD_BYTES,
+            "fixture must enter turn-loop spillover"
+        );
+
+        let mut spilled = crate::tools::spec::ToolResult::success(raw.clone());
+        let path = crate::tools::truncate::apply_spillover(&mut spilled, "call-local-secret")
+            .expect("turn-loop spillover");
+        assert_eq!(path.parent(), Some(spillover_root.as_path()));
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read local spillover")
+                .contains(CONFIG_SECRET_SENTINELS[6]),
+            "the full raw result remains available only in the local spillover store"
+        );
+        assert!(
+            !spilled.content.contains(CONFIG_SECRET_SENTINELS[6]),
+            "middle-only secret should not be present in retained head/tail"
+        );
+
+        let context = crate::tools::spec::ToolContext::new(tmp.path().to_path_buf());
+        let retrieved = crate::tools::spec::ToolSpec::execute(
+            &crate::tools::tool_result_retrieval::RetrieveToolResultTool,
+            json!({
+                "ref": "call-local-secret",
+                "mode": "query",
+                "query": CONFIG_SECRET_SENTINELS[6],
+            }),
+            &context,
+        )
+        .await
+        .expect("retrieve secret-bearing local spillover slice");
+        assert!(retrieved.content.contains(CONFIG_SECRET_SENTINELS[6]));
+
+        let client = client_with_config_secret_sentinels();
+        let prepared =
+            client.prepare_model_bound_request(request_with_tool_result(retrieved.content));
+        let wire = serde_json::to_string(&build_chat_messages_for_request(&prepared))
+            .expect("serialize sanitized retrieval result");
+        assert!(!wire.contains(CONFIG_SECRET_SENTINELS[6]));
+        assert!(wire.contains(codewhale_config::persistence::REDACTED));
+    }
+
+    #[test]
+    fn sha_spillover_persists_only_sanitized_tool_result() {
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(
+            tmp.path().join(".codewhale").join("tool_outputs"),
+        ));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        let client = client_with_config_secret_sentinels();
+        let raw = format!(
+            "{}\ncredential={}\n{}",
+            "ordinary output ".repeat(80),
+            CONFIG_SECRET_SENTINELS[6],
+            "tail ".repeat(80)
+        );
+        assert!(raw.len() > 1024, "fixture must enter SHA persistence path");
+        let raw_sha = crate::hashing::sha256_hex(raw.as_bytes());
+        let prepared = client.prepare_model_bound_request(request_with_tool_result(raw));
+        let sanitized = tool_result_content(&prepared).to_string();
+        let sanitized_sha = crate::hashing::sha256_hex(sanitized.as_bytes());
+
+        let wire = build_chat_messages_for_request(&prepared);
+        let serialized = serde_json::to_string(&wire).expect("serialize chat wire messages");
+        assert!(!serialized.contains(CONFIG_SECRET_SENTINELS[6]));
+
+        let sanitized_path = crate::tools::truncate::sha_spillover_path(&sanitized_sha)
+            .expect("sanitized spillover path");
+        let persisted = std::fs::read_to_string(&sanitized_path)
+            .expect("sanitized tool output should be persisted");
+        assert_eq!(persisted, sanitized);
+        assert!(!persisted.contains(CONFIG_SECRET_SENTINELS[6]));
+        assert!(persisted.contains(codewhale_config::persistence::REDACTED));
+
+        let raw_path =
+            crate::tools::truncate::sha_spillover_path(&raw_sha).expect("raw spillover path");
+        assert!(
+            !raw_path.exists(),
+            "unsanitized tool output must never be persisted by the wire adapter"
+        );
     }
 
     fn deepseek_anthropic_client(server: &MockServer) -> DeepSeekClient {

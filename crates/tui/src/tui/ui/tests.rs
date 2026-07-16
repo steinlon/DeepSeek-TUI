@@ -39,6 +39,30 @@ use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use tempfile::TempDir;
 
 #[test]
+fn permission_cycle_shortcut_accepts_both_shift_tab_encodings() {
+    assert!(is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::NONE,
+    )));
+    assert!(is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    assert!(is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::SHIFT,
+    )));
+    assert!(!is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    )));
+    assert!(!is_permission_cycle_shortcut(&KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::CONTROL,
+    )));
+}
+
+#[test]
 fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
     let mut app = create_test_app();
     // App::new reads real terminal overlays. This test owns the authored

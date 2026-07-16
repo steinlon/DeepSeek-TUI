@@ -305,7 +305,8 @@ pub struct Settings {
     pub max_input_history: usize,
     /// Default provider override (e.g. "deepseek", "openai").
     pub default_provider: Option<String>,
-    /// Default model to use
+    /// DeepSeek-only fallback model. Non-DeepSeek providers use the
+    /// provider-scoped entry in [`Self::provider_models`] instead.
     pub default_model: Option<String>,
     /// Default reasoning effort selected from the TUI model picker.
     /// `None` falls back to `config.toml` and then the runtime default.
@@ -1096,9 +1097,29 @@ impl Settings {
         lines.push(format!("  cost_currency:      {}", self.cost_currency));
         lines.push(format!("  max_history:        {}", self.max_input_history));
         lines.push(format!(
-            "  default_model:      {}",
+            "  deepseek_fallback:  {}",
             self.default_model.as_deref().unwrap_or("(default)")
         ));
+        lines.push(format!(
+            "  default_provider:   {}",
+            self.default_provider
+                .as_deref()
+                .unwrap_or("(config/default)")
+        ));
+        let mut provider_models = self
+            .provider_models
+            .as_ref()
+            .map(|models| models.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        provider_models.sort_by_key(|(provider, _)| *provider);
+        if provider_models.is_empty() {
+            lines.push("  provider_models:    (none)".to_string());
+        } else {
+            lines.push("  provider_models:".to_string());
+            for (provider, model) in provider_models {
+                lines.push(format!("    {provider}: {model}"));
+            }
+        }
         lines.push(format!(
             "  reasoning_effort:   {}",
             self.reasoning_effort
@@ -1235,7 +1256,7 @@ impl Settings {
             ("max_history", "Max input history entries"),
             (
                 "default_model",
-                "Default model: auto or any DeepSeek model ID (e.g. deepseek-v4-pro)",
+                "DeepSeek fallback model: auto or a DeepSeek model ID (e.g. deepseek-v4-pro); other providers use provider_models",
             ),
             (
                 "reasoning_effort",
@@ -2119,6 +2140,25 @@ mod tests {
             zh.contains("配置文件"),
             "chinese config label missing:\n{zh}"
         );
+    }
+
+    #[test]
+    fn display_separates_deepseek_fallback_from_provider_scoped_models() {
+        let mut settings = Settings {
+            default_provider: Some("zai".to_string()),
+            default_model: Some("deepseek-v4-pro".to_string()),
+            ..Settings::default()
+        };
+        settings.set_model_for_provider("zai", "GLM-5.2");
+        settings.set_model_for_provider("deepseek", "deepseek-v4-flash");
+
+        let display = settings.display(crate::localization::Locale::En);
+
+        assert!(display.contains("deepseek_fallback:  deepseek-v4-pro"));
+        assert!(display.contains("default_provider:   zai"));
+        assert!(display.contains("    zai: GLM-5.2"));
+        assert!(display.contains("    deepseek: deepseek-v4-flash"));
+        assert!(!display.contains("  default_model:"));
     }
 
     /// Tests that mutate process-global `NO_ANIMATIONS` serialise

@@ -76,10 +76,14 @@ pub fn display_chord(chord: &'static str) -> Cow<'static, str> {
 
 #[must_use]
 pub fn display_chord_for_platform(chord: &'static str, is_macos: bool) -> Cow<'static, str> {
-    if is_macos && chord.contains("Alt+") {
-        Cow::Owned(chord.replace("Alt+", "⌥"))
-    } else {
+    if !is_macos {
+        return Cow::Borrowed(chord);
+    }
+    let rendered = chord.replace("Alt+", "⌥").replace("F1", "fn+F1");
+    if rendered == chord {
         Cow::Borrowed(chord)
+    } else {
+        Cow::Owned(rendered)
     }
 }
 
@@ -94,7 +98,7 @@ pub fn footer_action_hints(include_context: bool) -> String {
 pub fn footer_action_hints_for_platform(include_context: bool, is_macos: bool) -> String {
     let details =
         display_chord_for_platform(binding(ShellBindingId::ToolDetails).footer_chord, is_macos);
-    let help = binding(ShellBindingId::Help).footer_chord;
+    let help = display_chord_for_platform(binding(ShellBindingId::Help).footer_chord, is_macos);
     if include_context {
         format!(
             "{details}:{{output}} · {}:{{context}} · {help}:{{keys}}",
@@ -128,6 +132,14 @@ pub fn is_help_shortcut(key: &KeyEvent) -> bool {
         return true;
     }
     if matches!(key.code, KeyCode::Char('/')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    // Some legacy terminal stacks encode Ctrl+/ as the ASCII unit separator,
+    // which crossterm reports as Ctrl+7 or Ctrl+_. Accept both portable
+    // decodings so the documented fallback remains real.
+    if matches!(key.code, KeyCode::Char('7') | KeyCode::Char('_'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
         return true;
     }
     // Alt+? still opens help where the terminal delivers it, but it is not
@@ -179,6 +191,9 @@ mod tests {
                 assert!(!hints.contains("Alt+?"), "{hints}");
                 assert!(!hints.contains("Alt+C"), "{hints}");
                 assert!(hints.contains("F1:"), "{hints}");
+                if is_macos {
+                    assert!(hints.contains("fn+F1:"), "{hints}");
+                }
                 if include_context {
                     assert!(hints.contains("/context:"), "{hints}");
                 }
@@ -194,6 +209,14 @@ mod tests {
         )));
         assert!(is_help_shortcut(&KeyEvent::new(
             KeyCode::Char('/'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_help_shortcut(&KeyEvent::new(
+            KeyCode::Char('7'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_help_shortcut(&KeyEvent::new(
+            KeyCode::Char('_'),
             KeyModifiers::CONTROL
         )));
         // Unadvertised but accepted where the terminal delivers them.

@@ -375,6 +375,38 @@ pub(crate) fn persist_provider_base_url_key(
     Ok(path)
 }
 
+/// Persist the model for one exact provider route without rewriting the
+/// legacy root DeepSeek fallback used by unrelated providers.
+///
+/// First-party DeepSeek retains its historical `default_text_model` root key.
+/// Every other built-in provider writes to its typed `[providers.<name>]`
+/// table, while named custom routes use their exact user-owned table id.
+pub(crate) fn persist_provider_model_key(
+    config_path: Option<&Path>,
+    provider: ApiProvider,
+    provider_identity: &str,
+    value: &str,
+) -> anyhow::Result<PathBuf> {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        return persist_root_string_key(config_path, "default_text_model", value);
+    }
+
+    let provider_key = if provider == ApiProvider::Custom {
+        normalize_custom_provider_id(provider_identity)?
+    } else {
+        provider
+            .metadata()
+            .context("provider config metadata")?
+            .provider_config_key()
+            .to_string()
+    };
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &["providers", &provider_key, "model"], value)
+    })?;
+    Ok(path)
+}
+
 fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static str> {
     match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => {

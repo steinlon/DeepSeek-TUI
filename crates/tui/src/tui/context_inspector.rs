@@ -39,6 +39,27 @@ const MAX_TOOL_ROWS: usize = 8;
 
 const SYSTEM_LAYER_MARKERS: &[(&str, &str, PromptLayerKind)] = &[
     (
+        "Bundled constitution",
+        "## Codewhale",
+        PromptLayerKind::Static,
+    ),
+    ("Language policy", "## Language", PromptLayerKind::Static),
+    (
+        "Output formatting",
+        "## Output Formatting",
+        PromptLayerKind::Static,
+    ),
+    (
+        "User-global constitution",
+        "<codewhale_user_constitution",
+        PromptLayerKind::Static,
+    ),
+    (
+        "Repository constitution",
+        "<codewhale_repo_constitution",
+        PromptLayerKind::Static,
+    ),
+    (
         "Project context",
         "<project_instructions",
         PromptLayerKind::Static,
@@ -91,6 +112,15 @@ impl PromptLayerKind {
             Self::Static => tr(locale, MessageId::CtxInspCacheFriendly),
             Self::Dynamic => tr(locale, MessageId::CtxInspChangesByTurn),
         }
+    }
+}
+
+/// Localize well-known layer labels that already have inspector MessageIds.
+/// Other layer names stay as English product identifiers.
+fn layer_display_name(name: &'static str, locale: Locale) -> Cow<'static, str> {
+    match name {
+        "Volatile working set" => tr(locale, MessageId::CtxInspVolatileWorkingSet),
+        other => Cow::Borrowed(other),
     }
 }
 
@@ -270,6 +300,23 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 "  {total_lbl}: {} {blocks_unit}, ~{total_est} {tokens_unit}",
                 blocks.len()
             );
+            let layers = blocks
+                .iter()
+                .flat_map(|block| split_text_prompt_layers(&block.text))
+                .filter(|layer| !layer.body.is_empty())
+                .collect::<Vec<_>>();
+            if layers.iter().any(|layer| layer.name != "System prompt") {
+                let _ = writeln!(out, "  {text_prompt_lbl}:");
+                for layer in layers {
+                    let tokens = text_tokens(layer.body);
+                    let kind_lbl = layer.kind.label(locale);
+                    let layer_name = layer_display_name(layer.name, locale);
+                    let _ = writeln!(
+                        out,
+                        "  - {layer_name}: ~{tokens} {tokens_unit} [{kind_lbl}]",
+                    );
+                }
+            }
         }
         Some(SystemPrompt::Text(text)) => {
             let layers = split_text_prompt_layers(text);
@@ -286,10 +333,10 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 for layer in layers {
                     let tokens = text_tokens(layer.body);
                     let kind_lbl = layer.kind.label(locale);
+                    let layer_name = layer_display_name(layer.name, locale);
                     let _ = writeln!(
                         out,
-                        "  - {}: ~{tokens} {tokens_unit} [{kind_lbl}]",
-                        layer.name,
+                        "  - {layer_name}: ~{tokens} {tokens_unit} [{kind_lbl}]",
                     );
                 }
             } else {
@@ -915,13 +962,17 @@ mod tests {
     fn inspector_text_prompt_shows_layer_map() {
         let mut app = test_app();
         app.system_prompt = Some(SystemPrompt::Text(
-            "You are CodeWhale.\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
+            "## Codewhale\nBundled base law.\n\n## Language\nUse English.\n\n## Output Formatting\nBe clear.\n\n<codewhale_user_constitution>\nUser law\n</codewhale_user_constitution>\n\n<codewhale_repo_constitution>\nRepo law\n</codewhale_repo_constitution>\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
         ));
 
         let text = build_context_inspector_text(&app, Locale::En);
         assert!(text.contains("System Prompt Structure"));
         assert!(text.contains("Text prompt layers"));
-        assert!(text.contains("Global system prefix"));
+        assert!(text.contains("Bundled constitution"));
+        assert!(text.contains("Language policy"));
+        assert!(text.contains("Output formatting"));
+        assert!(text.contains("User-global constitution"));
+        assert!(text.contains("Repository constitution"));
         assert!(text.contains("Project context"));
         assert!(text.contains("Project context pack"));
         assert!(text.contains("Environment"));

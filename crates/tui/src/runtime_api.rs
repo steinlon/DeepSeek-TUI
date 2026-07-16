@@ -38,7 +38,9 @@ use crate::automation_manager::{
     AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedulerConfig,
     CreateAutomationRequest, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
 };
-use crate::config::{Config, DEFAULT_TEXT_MODEL};
+use crate::config::{
+    ApiProvider, Config, DEFAULT_TEXT_MODEL, normalize_model_name_for_provider, validate_route,
+};
 use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
 use crate::fleet::ledger::{FleetLedgerState, FleetTaskLedgerStatus};
 use crate::fleet::manager::{
@@ -2633,8 +2635,12 @@ async fn get_config(
     let reasoning_effort = config.reasoning_effort().unwrap_or("auto").to_string();
     let cost_currency = settings.cost_currency.clone();
     let default_mode = settings.default_mode.as_str().to_string();
-    let default_model = settings
-        .default_model
+    // This field is the legacy root DeepSeek fallback, not the active
+    // provider model above. Keeping the two explicit prevents a Z.ai model
+    // update from silently rewriting a future DeepSeek route.
+    let default_model = config
+        .default_text_model
+        .clone()
         .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string());
     let base_url = config.deepseek_base_url().to_string();
 
@@ -2677,8 +2683,26 @@ async fn set_config(
     use crate::config_persistence;
 
     let key = req.key.to_lowercase();
-    let value = req.value;
+    let mut value = req.value;
     let persist = req.persist;
+
+    // Validate model keys even for dry-run requests. Model ids are provider
+    // owned; accepting a DeepSeek id while Z.ai is active creates a saved
+    // route that cannot execute after reload.
+    let active_route = {
+        let config = state.config.read();
+        let provider = config.api_provider();
+        (provider, config.provider_identity_for(provider))
+    };
+    match key.as_str() {
+        "model" => {
+            value = normalize_runtime_config_model(active_route.0, &value)?;
+        }
+        "default_model" => {
+            value = normalize_runtime_config_model(ApiProvider::Deepseek, &value)?;
+        }
+        _ => {}
+    }
 
     // All persisted config keys require a reload to take effect in the
     // runtime (including syncing to active engines). The caller should
@@ -2691,7 +2715,13 @@ async fn set_config(
     if persist {
         let config_path = state.config_path.as_deref();
         let result: anyhow::Result<PathBuf> = match key.as_str() {
-            "model" | "default_model" => config_persistence::persist_root_string_key(
+            "model" => config_persistence::persist_provider_model_key(
+                config_path,
+                active_route.0,
+                &active_route.1,
+                &value,
+            ),
+            "default_model" => config_persistence::persist_root_string_key(
                 config_path,
                 "default_text_model",
                 &value,
@@ -2845,6 +2875,20 @@ async fn set_config(
         persisted: persist,
         requires_reload,
     }))
+}
+
+fn normalize_runtime_config_model(provider: ApiProvider, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    validate_route(provider, value).map_err(ApiError::bad_request)?;
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+    normalize_model_name_for_provider(provider, value).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "Invalid model '{value}' for provider '{}'.",
+            provider.as_str()
+        ))
+    })
 }
 
 async fn reload_config(

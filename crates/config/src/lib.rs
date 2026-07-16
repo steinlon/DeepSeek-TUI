@@ -3495,28 +3495,78 @@ fn checked_config_backup_path(path: &Path) -> Result<PathBuf> {
     checked_config_sibling_path(path, &config_backup_file_name(path))
 }
 
-fn write_one_time_config_backup(path: &Path) -> Result<()> {
+/// Remove plaintext `api_key` entries from the one-time config backup, if it
+/// exists.
+///
+/// Credential migration deliberately preserves the rest of `config.toml.bak`
+/// while ensuring that moving a key into the durable secret store does not
+/// leave the same credential behind in an older backup.
+pub fn scrub_plaintext_api_keys_from_config_backup(path: &Path) -> Result<()> {
     let backup = checked_config_backup_path(path)?;
-    if backup.exists() {
+    if !backup.exists() {
         return Ok(());
     }
-    fs::copy(path, &backup).with_context(|| {
+
+    let raw = read_checked_toml_file(&backup, "config backup")?;
+    let scrubbed = config_toml_without_plaintext_api_keys(&raw).with_context(|| {
         format!(
-            "failed to create config backup {} from {}",
-            backup.display(),
-            path.display()
+            "failed to scrub plaintext API keys from config backup {}",
+            backup.display()
         )
     })?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).with_context(|| {
+    if scrubbed != raw {
+        persistence::atomic_write(&backup, scrubbed.as_bytes()).with_context(|| {
             format!(
-                "failed to set config backup permissions at {}",
+                "failed to write credential-free config backup {}",
                 backup.display()
             )
         })?;
     }
     Ok(())
+}
+
+fn write_one_time_config_backup(path: &Path) -> Result<()> {
+    let backup = checked_config_backup_path(path)?;
+    if backup.exists() {
+        return scrub_plaintext_api_keys_from_config_backup(path);
+    }
+
+    let raw = read_checked_config_file(path)?;
+    let scrubbed = config_toml_without_plaintext_api_keys(&raw).with_context(|| {
+        format!(
+            "failed to scrub plaintext API keys while creating config backup {}",
+            backup.display()
+        )
+    })?;
+    persistence::atomic_write(&backup, scrubbed.as_bytes()).with_context(|| {
+        format!(
+            "failed to create credential-free config backup {} from {}",
+            backup.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn config_toml_without_plaintext_api_keys(raw: &str) -> Result<String> {
+    let mut document = raw
+        .parse::<toml_edit::DocumentMut>()
+        .context("failed to parse config TOML while removing plaintext API keys")?;
+    remove_plaintext_api_keys_recursive(document.as_table_mut());
+    Ok(document.to_string())
+}
+
+fn remove_plaintext_api_keys_recursive(table: &mut dyn toml_edit::TableLike) {
+    table.remove("api_key");
+    for (_, item) in table.iter_mut() {
+        if let toml_edit::Item::ArrayOfTables(tables) = item {
+            for nested in tables.iter_mut() {
+                remove_plaintext_api_keys_recursive(nested);
+            }
+        } else if let Some(nested) = item.as_table_like_mut() {
+            remove_plaintext_api_keys_recursive(nested);
+        }
+    }
 }
 
 /// Merge comments and formatting from an original TOML file into a

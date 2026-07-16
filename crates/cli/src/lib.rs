@@ -1778,33 +1778,9 @@ fn resolve_runtime_for_dispatch_with_secrets(
     runtime_overrides: &CliRuntimeOverrides,
     secrets: &Secrets,
 ) -> ResolvedRuntimeOptions {
-    let mut resolved = store
+    store
         .config
-        .resolve_runtime_options_with_secrets(runtime_overrides, secrets);
-
-    if resolved.api_key_source == Some(RuntimeApiKeySource::Keyring)
-        && !provider_config_set(store, resolved.provider)
-        && let Some(api_key) = resolved.api_key.clone()
-    {
-        write_provider_api_key_to_config(store, resolved.provider, &api_key);
-        match store.save() {
-            Ok(()) => {
-                eprintln!(
-                    "info: recovered API key from secret store and saved it to {}",
-                    store.path().display()
-                );
-                resolved.api_key_source = Some(RuntimeApiKeySource::ConfigFile);
-            }
-            Err(err) => {
-                eprintln!(
-                    "warning: recovered API key from secret store but failed to save {}: {err}",
-                    store.path().display()
-                );
-            }
-        }
-    }
-
-    resolved
+        .resolve_runtime_options_with_secrets(runtime_overrides, secrets)
 }
 
 fn tui_args(command: &str, args: TuiPassthroughArgs) -> Vec<String> {
@@ -1848,11 +1824,9 @@ fn run_login_command_with_secrets(
         Some(v) => v,
         None => read_api_key_from_stdin()?,
     };
-    write_provider_api_key_to_config(store, provider, &api_key);
-    let keyring_saved = write_provider_api_key_to_keyring(secrets, provider, &api_key);
-    store.save()?;
-    let destination = if keyring_saved {
-        format!("{} and {}", store.path().display(), secrets.backend_name())
+    let secret_store_saved = persist_provider_api_key(store, secrets, provider, &api_key)?;
+    let destination = if secret_store_saved {
+        secrets.backend_name().to_string()
     } else {
         store.path().display().to_string()
     };
@@ -1905,10 +1879,17 @@ fn write_provider_api_key_to_config(
     provider: ProviderKind,
     api_key: &str,
 ) {
-    store.config.auth_mode = Some("api_key".to_string());
+    prepare_provider_api_key_metadata(store, provider);
     store.config.providers.for_provider_mut(provider).api_key = Some(api_key.to_string());
     if provider == ProviderKind::Deepseek {
         store.config.api_key = Some(api_key.to_string());
+    }
+}
+
+fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: ProviderKind) {
+    store.config.auth_mode = Some("api_key".to_string());
+    store.config.providers.for_provider_mut(provider).auth_mode = Some("api_key".to_string());
+    if provider == ProviderKind::Deepseek {
         if store.config.default_text_model.is_none() {
             store.config.default_text_model = Some(
                 store
@@ -1921,6 +1902,34 @@ fn write_provider_api_key_to_config(
             );
         }
     }
+}
+
+/// Persist a provider credential to the durable secret store first. A
+/// plaintext config slot is used only when that write fails.
+fn persist_provider_api_key(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+    api_key: &str,
+) -> Result<bool> {
+    prepare_provider_api_key_metadata(store, provider);
+    let secret_store_saved = match secrets.set(provider_slot(provider), api_key) {
+        Ok(()) => {
+            clear_provider_api_key_from_config(store, provider);
+            true
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: secret-store write failed for {}; using owner-only config fallback: {err}",
+                provider_slot(provider)
+            );
+            write_provider_api_key_to_config(store, provider, api_key);
+            false
+        }
+    };
+    store.save()?;
+    codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())?;
+    Ok(secret_store_saved)
 }
 
 fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: ProviderKind) {
@@ -1996,14 +2005,6 @@ fn provider_keyring_api_key(secrets: &Secrets, provider: ProviderKind) -> Option
 
 fn provider_keyring_set(secrets: &Secrets, provider: ProviderKind) -> bool {
     provider_keyring_api_key(secrets, provider).is_some()
-}
-
-fn write_provider_api_key_to_keyring(
-    secrets: &Secrets,
-    provider: ProviderKind,
-    api_key: &str,
-) -> bool {
-    secrets.set(provider_slot(provider), api_key).is_ok()
 }
 
 fn clear_provider_api_key_from_keyring(secrets: &Secrets, provider: ProviderKind) {
@@ -2278,15 +2279,12 @@ fn run_auth_command_with_secrets(
                 (None, true) => read_api_key_from_stdin()?,
                 (None, false) => prompt_api_key(slot)?,
             };
-            write_provider_api_key_to_config(store, provider, &api_key);
-            let keyring_saved = write_provider_api_key_to_keyring(secrets, provider, &api_key);
-            store.save()?;
+            let secret_store_saved = persist_provider_api_key(store, secrets, provider, &api_key)?;
             // Don't print the key. Don't echo length.
-            if keyring_saved {
+            if secret_store_saved {
                 println!(
-                    "saved API key for {slot} to {} and {}",
-                    store.path().display(),
-                    secrets.backend_name()
+                    "saved API key for {slot} to {} (config contains metadata only)",
+                    secrets.backend_name(),
                 );
             } else {
                 println!("saved API key for {slot} to {}", store.path().display());
@@ -2413,6 +2411,10 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
         store
             .save()
             .context("failed to write updated config.toml")?;
+    }
+    if !dry_run {
+        codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())
+            .context("failed to remove plaintext API keys from config backup")?;
     }
 
     println!("secret store backend: {}", secrets.backend_name());
@@ -4360,14 +4362,16 @@ model = "qwen-2.5-7b"
     }
 
     #[test]
-    fn deepseek_login_writes_shared_config_and_preserves_tui_defaults() {
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "deepseek-cli-login-test-{}-{nanos}.toml",
-            std::process::id()
-        ));
+    fn deepseek_login_uses_isolated_file_store_and_preserves_tui_defaults() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let codewhale_home = dir.path().join("codewhale-home");
+        let codewhale_home_value = codewhale_home.to_string_lossy().into_owned();
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &codewhale_home_value);
+        let _backend = ScopedEnvVar::set("CODEWHALE_SECRET_BACKEND", "file");
+        let path = codewhale_home.join("config.toml");
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
-        let secrets = no_keyring_secrets();
+        let secrets = Secrets::auto_detect();
 
         run_login_command_with_secrets(
             &mut store,
@@ -4377,22 +4381,26 @@ model = "qwen-2.5-7b"
             },
             &secrets,
         )
-        .expect("login should write config");
+        .expect("login should persist credential");
 
-        assert_eq!(store.config.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(
-            store.config.providers.deepseek.api_key.as_deref(),
-            Some("sk-test")
-        );
+        assert!(store.config.api_key.is_none());
+        assert!(store.config.providers.deepseek.api_key.is_none());
         assert_eq!(
             store.config.default_text_model.as_deref(),
             Some("deepseek-v4-pro")
         );
         let saved = std::fs::read_to_string(&path).expect("config should be written");
-        assert!(saved.contains("api_key = \"sk-test\""));
+        assert!(!saved.contains("sk-test"), "{saved}");
+        assert!(
+            !saved
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key ="))
+        );
         assert!(saved.contains("default_text_model = \"deepseek-v4-pro\""));
-
-        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            secrets.get("deepseek").expect("read secret").as_deref(),
+            Some("sk-test")
+        );
     }
 
     #[test]
@@ -4619,7 +4627,7 @@ model = "qwen-2.5-7b"
     }
 
     #[test]
-    fn auth_set_writes_to_shared_config_file() {
+    fn auth_set_writes_secret_store_and_keeps_config_credential_free() {
         use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
@@ -4643,19 +4651,70 @@ model = "qwen-2.5-7b"
         )
         .expect("set should succeed");
 
-        assert_eq!(store.config.api_key.as_deref(), Some("sk-keyring"));
-        assert_eq!(
-            store.config.providers.deepseek.api_key.as_deref(),
-            Some("sk-keyring")
-        );
+        assert!(store.config.api_key.is_none());
+        assert!(store.config.providers.deepseek.api_key.is_none());
         let saved = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(saved.contains("api_key = \"sk-keyring\""));
+        assert!(!saved.contains("sk-keyring"), "{saved}");
+        assert!(
+            !saved
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key ="))
+        );
         assert_eq!(
             inner.get("deepseek").unwrap().as_deref(),
             Some("sk-keyring")
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auth_set_uses_plaintext_config_only_when_secret_store_write_fails() {
+        use codewhale_secrets::{KeyringStore, SecretsError};
+        use std::sync::Arc;
+
+        struct FailingStore;
+
+        impl KeyringStore for FailingStore {
+            fn get(&self, _key: &str) -> Result<Option<String>, SecretsError> {
+                Ok(None)
+            }
+
+            fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+                Err(SecretsError::Keyring("test write failure".to_string()))
+            }
+
+            fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+                Ok(())
+            }
+
+            fn backend_name(&self) -> &'static str {
+                "failing test store"
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+        let secrets = Secrets::new(Arc::new(FailingStore));
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Set {
+                provider: ProviderArg::Openrouter,
+                api_key: Some("fallback-test-credential".to_string()),
+                api_key_stdin: false,
+            },
+            &secrets,
+        )
+        .expect("config fallback");
+
+        assert_eq!(
+            store.config.providers.openrouter.api_key.as_deref(),
+            Some("fallback-test-credential")
+        );
+        let saved = std::fs::read_to_string(path).expect("config fallback file");
+        assert!(saved.contains("fallback-test-credential"));
     }
 
     #[test]
@@ -4681,16 +4740,18 @@ model = "qwen-2.5-7b"
         .expect("set should succeed");
 
         assert_eq!(store.config.provider, ProviderKind::Deepseek);
+        assert!(store.config.providers.arcee.api_key.is_none());
         assert_eq!(
-            store.config.providers.arcee.api_key.as_deref(),
-            Some("arcee-key")
+            store.config.providers.arcee.auth_mode.as_deref(),
+            Some("api_key")
         );
 
         let reloaded = ConfigStore::load(Some(path.clone())).expect("store should reload");
         assert_eq!(reloaded.config.provider, ProviderKind::Deepseek);
+        assert!(reloaded.config.providers.arcee.api_key.is_none());
         assert_eq!(
-            reloaded.config.providers.arcee.api_key.as_deref(),
-            Some("arcee-key")
+            reloaded.config.providers.arcee.auth_mode.as_deref(),
+            Some("api_key")
         );
 
         let _ = std::fs::remove_file(path);
@@ -5003,7 +5064,7 @@ model = "qwen-2.5-7b"
     }
 
     #[test]
-    fn dispatch_keyring_recovery_self_heals_into_config_file() {
+    fn dispatch_uses_secret_store_without_rehydrating_plaintext_config() {
         use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
@@ -5024,28 +5085,27 @@ model = "qwen-2.5-7b"
         );
 
         assert_eq!(resolved.api_key.as_deref(), Some("ring-key"));
-        assert_eq!(
-            resolved.api_key_source,
-            Some(RuntimeApiKeySource::ConfigFile)
+        assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Keyring));
+        assert!(store.config.api_key.is_none());
+        assert!(store.config.providers.deepseek.api_key.is_none());
+        assert!(
+            !path.exists(),
+            "dispatch must not create config from a stored key"
         );
-        assert_eq!(store.config.api_key.as_deref(), Some("ring-key"));
-        assert_eq!(
-            store.config.providers.deepseek.api_key.as_deref(),
-            Some("ring-key")
-        );
-
-        let saved = std::fs::read_to_string(&path).expect("config should be written");
-        assert!(saved.contains("api_key = \"ring-key\""));
 
         let resolved_again = resolve_runtime_for_dispatch_with_secrets(
             &mut store,
             &CliRuntimeOverrides::default(),
-            &no_keyring_secrets(),
+            &secrets,
         );
         assert_eq!(resolved_again.api_key.as_deref(), Some("ring-key"));
         assert_eq!(
             resolved_again.api_key_source,
-            Some(RuntimeApiKeySource::ConfigFile)
+            Some(RuntimeApiKeySource::Keyring)
+        );
+        assert!(
+            !path.exists(),
+            "repeat dispatch must remain credential-file free"
         );
 
         let _ = std::fs::remove_file(path);
@@ -5116,6 +5176,38 @@ model = "qwen-2.5-7b"
         assert!(!saved.contains("sk-deep"), "plaintext leaked: {saved}");
         assert!(!saved.contains("or-key"), "plaintext leaked: {saved}");
         assert!(!saved.contains("nv-key"), "plaintext leaked: {saved}");
+
+        let backup_path = path.with_file_name(format!(
+            "{}.bak",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let backup = std::fs::read_to_string(&backup_path).expect("credential-free backup");
+        assert!(
+            !backup.contains("sk-deep"),
+            "plaintext leaked in backup: {backup}"
+        );
+        assert!(
+            !backup.contains("or-key"),
+            "plaintext leaked in backup: {backup}"
+        );
+        assert!(
+            !backup.contains("nv-key"),
+            "plaintext leaked in backup: {backup}"
+        );
+
+        let resolved = resolve_runtime_for_dispatch_with_secrets(
+            &mut store,
+            &CliRuntimeOverrides::default(),
+            &secrets,
+        );
+        assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Keyring));
+        let after_dispatch = std::fs::read_to_string(&path).expect("config after dispatch");
+        assert!(!after_dispatch.contains("sk-deep"), "{after_dispatch}");
+        assert!(
+            !after_dispatch
+                .lines()
+                .any(|line| line.trim_start().starts_with("api_key ="))
+        );
 
         let _ = std::fs::remove_file(path);
     }

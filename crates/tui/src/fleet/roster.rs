@@ -540,6 +540,11 @@ mod tests {
 
     #[test]
     fn model_overrides_use_lowercased_ids_and_only_explicit_models() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let home = TempDir::new().unwrap();
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        // Isolate personal `$CODEWHALE_HOME/agents` so ambient developer
+        // profiles cannot pin built-ins like manager during unit tests.
         let tmp = TempDir::new().unwrap();
         let config = config_with_profiles(BTreeMap::from([
             (

@@ -27,7 +27,7 @@ use super::{
 const CODEX_RESPONSES_PATH: &str = "/codex/responses";
 
 /// Build the Responses API request body from a `MessageRequest`.
-fn build_responses_body(request: &MessageRequest) -> Value {
+pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
     let model = &request.model;
     let mut body = json!({
         "model": model,

@@ -14,7 +14,7 @@ Usage:
 
 Environment:
   CODEWHALE_INSTALL_DIR    Install directory. Default: $HOME/.local/bin
-  CODEWHALE_VERSION        Release tag to install, for example v0.8.64. Default: latest
+  CODEWHALE_VERSION        Release tag to install, for example v0.9.0. Default: latest
   CODEWHALE_RELEASE_BASE_URL
                            Custom release asset base URL ending in /download
   CODEWHALE_SKIP_GLIBC_CHECK=1
@@ -22,7 +22,7 @@ Environment:
 
 Examples:
   curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR=/usr/local/bin sh
-  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=v0.8.64 sh
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=v0.9.0 sh
 USAGE
 }
 

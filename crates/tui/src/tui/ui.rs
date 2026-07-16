@@ -26,7 +26,8 @@ use crossterm::event::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -1124,6 +1125,14 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
             .await;
     }
 
+    // The engine owns the canonical model-facing prompt from startup. Mirror
+    // that exact value before the first draw so `/context` never reports an
+    // empty system prompt merely because no user turn has been submitted yet.
+    match engine_handle.get_session_snapshot().await {
+        Ok(snapshot) => app.system_prompt = snapshot.system_prompt,
+        Err(err) => tracing::warn!("could not mirror initial engine system prompt: {err:#}"),
+    }
+
     // Fire session start hook
     {
         let context = app.base_hook_context();
@@ -1683,13 +1692,18 @@ fn build_app_system_prompt_with_goal(
     goal_objective: Option<&str>,
 ) -> SystemPrompt {
     let instructions = configured_instruction_sources(config);
+    let memory_path = config.memory_path();
+    let user_memory_block = crate::memory::compose_block(
+        config.memory_enabled() && !config.moraine_fallback(),
+        &memory_path,
+    );
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
         None,
-        None,
+        Some(&app.skills_dir),
         Some(&instructions),
         prompts::PromptSessionContext {
-            user_memory_block: None,
+            user_memory_block: user_memory_block.as_deref(),
             goal_objective,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             locale_tag: app.ui_locale.tag(),
@@ -4439,6 +4453,19 @@ async fn run_event_loop(
                 continue;
             }
 
+            // Help is shell-global, including onboarding, launch, and modal
+            // surfaces. `/help` remains the guaranteed textual route; this
+            // handles function-key and control-key terminal encodings.
+            if crate::tui::shell_key_routing::is_help_shortcut(&key) {
+                if app.view_stack.top_kind() == Some(ModalKind::Help) {
+                    app.view_stack.pop();
+                } else {
+                    app.view_stack
+                        .push(HelpView::new_for_shortcuts(app.ui_locale));
+                }
+                continue;
+            }
+
             // Handle onboarding flow
             if app.onboarding != OnboardingState::None {
                 match key.code {
@@ -4725,18 +4752,6 @@ async fn run_event_loop(
                 continue;
             }
 
-            // Help: Alt+?, F1, and Ctrl+/ — one matcher. Ambiguous printable
-            // Option glyphs stay composer input on international layouts.
-            if crate::tui::shell_key_routing::is_help_shortcut(&key) {
-                if app.view_stack.top_kind() == Some(ModalKind::Help) {
-                    app.view_stack.pop();
-                } else {
-                    app.view_stack
-                        .push(HelpView::new_for_shortcuts(app.ui_locale));
-                }
-                continue;
-            }
-
             if key.code == KeyCode::Char('x')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
                 && prefill_jobs_cancel_all_if_tasks_sidebar(app)
@@ -4879,6 +4894,34 @@ async fn run_event_loop(
                 && app.view_stack.is_empty()
             {
                 open_context_inspector(app);
+                continue;
+            }
+
+            // Shift+Tab is a shell-level permission control. Keep it live in
+            // the composer and the Config surface, while leaving approval,
+            // elevation, setup, and other focused workflows in full control
+            // of their own keys. Accept both terminal encodings used for the
+            // same chord (`BackTab` and `Tab` + SHIFT).
+            if is_permission_cycle_shortcut(&key)
+                && matches!(app.view_stack.top_kind(), None | Some(ModalKind::Config))
+            {
+                let control = config.approval_policy_control(
+                    app.config_path.as_deref(),
+                    app.config_profile.as_deref(),
+                    &app.workspace,
+                );
+                let changed = if control == crate::config::ApprovalPolicyControl::RootConfig {
+                    app.cycle_root_approval_posture()
+                } else {
+                    app.cycle_approval_posture()
+                };
+                if changed {
+                    if control == crate::config::ApprovalPolicyControl::RootConfig {
+                        config.approval_policy = None;
+                    }
+                    sync_mode_update(app, &engine_handle).await;
+                    refresh_config_view_if_open(app, "permission_posture");
+                }
                 continue;
             }
 
@@ -5474,10 +5517,6 @@ async fn run_event_loop(
                             .await;
                     }
                 }
-                KeyCode::BackTab if app.cycle_approval_posture() => {
-                    sync_mode_update(app, &engine_handle).await;
-                }
-                KeyCode::BackTab => {}
                 // Transcript-nav shortcuts now require Alt, leaving most bare
                 // letters free to insert as text. Before v0.8.30, bare `g`,
                 // `G`, `[`, `]`, `?`, and `l` on an empty composer were
@@ -8140,6 +8179,15 @@ async fn sync_mode_update(app: &App, engine_handle: &EngineHandle) {
             approval_mode: app.approval_mode,
         })
         .await;
+}
+
+fn is_permission_cycle_shortcut(key: &KeyEvent) -> bool {
+    let forbidden = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
+    if key.modifiers.intersects(forbidden) {
+        return false;
+    }
+    matches!(key.code, KeyCode::BackTab)
+        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 async fn apply_mode_update(app: &mut App, engine_handle: &EngineHandle, mode: AppMode) -> bool {

@@ -2384,9 +2384,8 @@ fn saved_credential_describe_returns_config_file_path() {
     assert_eq!(cf.describe(), "/tmp/x.toml");
 }
 
-/// #593: the dual-write outcome describes both targets so the onboarding toast
-/// (`API key saved to {describe}`) tells the user the key landed in both the
-/// selected durable secret store and the inspectable config file.
+/// The durable-store outcome makes it explicit that config contains metadata,
+/// not a second plaintext credential copy.
 #[test]
 fn saved_credential_describe_lists_both_targets_for_keyring_and_config() {
     let dual = SavedCredential::KeyringAndConfigFile {
@@ -2395,8 +2394,100 @@ fn saved_credential_describe_lists_both_targets_for_keyring_and_config() {
     };
     assert_eq!(
         dual.describe(),
-        "secret store (system keyring) and /tmp/x.toml"
+        "secret store (system keyring); credential-free config metadata in /tmp/x.toml"
     );
+}
+
+#[test]
+fn save_deepseek_key_uses_isolated_file_store_without_plaintext_config() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+    let codewhale_home = temp_root.path().join("codewhale-home");
+    let config_path = codewhale_home.join("config.toml");
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", codewhale_home.as_os_str());
+    let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config_path.as_os_str());
+    let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+
+    let saved = save_api_key("deepseek-test-credential")?;
+    assert!(matches!(
+        saved,
+        SavedCredential::KeyringAndConfigFile { .. }
+    ));
+
+    let config = fs::read_to_string(&config_path)?;
+    assert!(!config.contains("deepseek-test-credential"), "{config}");
+    assert!(
+        !config
+            .lines()
+            .any(|line| line.trim_start().starts_with("api_key ="))
+    );
+    assert!(config.contains("auth_mode = \"api_key\""));
+    assert_eq!(
+        codewhale_secrets::Secrets::auto_detect().get("deepseek")?,
+        Some("deepseek-test-credential".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn save_non_deepseek_key_uses_isolated_file_store_without_plaintext_config() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+    let codewhale_home = temp_root.path().join("codewhale-home");
+    let config_path = codewhale_home.join("config.toml");
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", codewhale_home.as_os_str());
+    let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config_path.as_os_str());
+    let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+
+    save_api_key_for(ApiProvider::Openrouter, "openrouter-test-credential")?;
+
+    let config = fs::read_to_string(&config_path)?;
+    assert!(!config.contains("openrouter-test-credential"), "{config}");
+    let parsed: toml::Value = toml::from_str(&config)?;
+    let openrouter = parsed
+        .get("providers")
+        .and_then(|providers| providers.get("openrouter"))
+        .expect("openrouter metadata table");
+    assert!(openrouter.get("api_key").is_none());
+    assert_eq!(
+        openrouter.get("auth_mode").and_then(toml::Value::as_str),
+        Some("api_key")
+    );
+    assert_eq!(
+        codewhale_secrets::Secrets::auto_detect().get("openrouter")?,
+        Some("openrouter-test-credential".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn save_key_falls_back_to_config_when_isolated_file_store_is_unwritable() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+    let codewhale_home = temp_root.path().join("codewhale-home");
+    let config_path = codewhale_home.join("config.toml");
+    fs::create_dir_all(codewhale_home.join("secrets"))?;
+    fs::write(
+        codewhale_home.join("secrets/secrets.json"),
+        "not valid json",
+    )?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        codewhale_home.join("secrets/secrets.json"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", codewhale_home.as_os_str());
+    let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config_path.as_os_str());
+    let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+
+    let saved = save_api_key("fallback-test-credential")?;
+    assert_eq!(saved, SavedCredential::ConfigFile(config_path.clone()));
+    let config = fs::read_to_string(config_path)?;
+    assert!(config.contains("fallback-test-credential"));
+    Ok(())
 }
 
 #[test]

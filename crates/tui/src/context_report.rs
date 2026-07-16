@@ -130,6 +130,7 @@ impl SourceEntry {
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Constitution,
+    UserConstitution,
     RepoConstitution,
     ProjectContext,
     ProjectContextWarning,
@@ -303,17 +304,30 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
 fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution =
-        crate::prompts::compose_prompt_with_approval_model_and_shell(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
-        "Constitution and static prompt",
+        "Bundled constitution, language policy, and output policy",
         Some("crates/tui/src/prompts/constitution.md".to_string()),
         ActivationReason::AlwaysOn,
         &constitution,
         CountingConfidence::High,
         Some(1),
     ));
+
+    if let Some(block) = crate::prompts::load_user_constitution_block() {
+        builder.push(SourceEntry::text(
+            SourceKind::UserConstitution,
+            "User-global constitution",
+            codewhale_config::UserConstitution::path()
+                .ok()
+                .map(|path| path.display().to_string()),
+            ActivationReason::FilePresent,
+            &block,
+            CountingConfidence::High,
+            Some(2),
+        ));
+    }
 
     let project_context = crate::project_context::load_project_context_with_parents(workspace);
     if let Some(block) = project_context.constitution_block.as_deref() {

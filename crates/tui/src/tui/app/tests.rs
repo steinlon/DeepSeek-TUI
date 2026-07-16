@@ -2056,6 +2056,41 @@ fn permission_postures_persist_across_restart() {
 }
 
 #[test]
+fn shift_tab_migrates_user_root_policy_to_durable_tui_posture() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let settings_path = tmp.path().join("settings.toml");
+    std::fs::write(&config_path, "# keep\napproval_policy = \"on-request\"\n")
+        .expect("root config");
+    std::fs::write(&settings_path, "permission_posture = \"full-access\"\n").expect("settings");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
+    let config = Config::load(Some(config_path.clone()), None).expect("load config");
+    let mut options = test_options(false);
+    options.start_in_agent_mode = true;
+    options.config_path = Some(config_path.clone());
+
+    let mut app = App::new(options.clone(), &config);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert!(app.approval_policy_locked());
+
+    assert!(app.cycle_root_approval_posture());
+    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert!(!app.approval_policy_locked());
+    let saved_config = std::fs::read_to_string(&config_path).expect("saved config");
+    assert!(saved_config.contains("# keep"));
+    assert!(!saved_config.contains("approval_policy"));
+    let saved_settings = std::fs::read_to_string(&settings_path).expect("saved settings");
+    assert!(saved_settings.contains("permission_posture = \"auto-review\""));
+
+    let restarted_config = Config::load(Some(config_path), None).expect("reload config");
+    let restarted = App::new(options, &restarted_config);
+    assert_eq!(restarted.approval_mode, ApprovalMode::Auto);
+    assert!(!restarted.approval_policy_locked());
+}
+
+#[test]
 fn legacy_yolo_migrates_root_policy_to_agent_full_access() {
     let _env_lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");

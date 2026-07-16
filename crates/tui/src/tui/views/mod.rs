@@ -1259,6 +1259,23 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             }
         };
+        let routing_model = if app.auto_model {
+            app.last_effective_model
+                .as_deref()
+                .unwrap_or(app.model.as_str())
+        } else {
+            app.model.as_str()
+        };
+        let fast_model =
+            crate::model_routing::provider_router_candidates(app.api_provider, routing_model)
+                .cheap
+                .unwrap_or_else(|| {
+                    if app.auto_model && app.last_effective_model.is_none() {
+                        "available after Auto selects a route".to_string()
+                    } else {
+                        "no known fast sibling".to_string()
+                    }
+                });
         let mut rows = vec![
             ConfigRow {
                 section: ConfigSection::Provider,
@@ -1277,8 +1294,19 @@ impl ConfigView {
             ConfigRow {
                 section: ConfigSection::Model,
                 key: "model".to_string(),
-                value: app.model.clone(),
+                value: format!(
+                    "{} / {}",
+                    app.api_provider.as_str(),
+                    app.model_display_label()
+                ),
                 editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Model,
+                key: "fast_model".to_string(),
+                value: fast_model,
+                editable: false,
                 scope: ConfigScope::Session,
             },
             ConfigRow {
@@ -1289,7 +1317,7 @@ impl ConfigView {
                     .as_deref()
                     .unwrap_or(&*tr(app.ui_locale, MessageId::ConfigDefaultValue))
                     .to_string(),
-                editable: true,
+                editable: false,
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
@@ -1359,13 +1387,6 @@ impl ConfigView {
                 section: ConfigSection::Display,
                 key: "ocean_treatment".to_string(),
                 value: settings.ocean_treatment.clone(),
-                editable: true,
-                scope: ConfigScope::Saved,
-            },
-            ConfigRow {
-                section: ConfigSection::Display,
-                key: "work_surface_placement".to_string(),
-                value: settings.work_surface_placement.clone(),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -1506,6 +1527,13 @@ impl ConfigView {
                 section: ConfigSection::Composer,
                 key: "workspace_follow_symlinks".to_string(),
                 value: settings.workspace_follow_symlinks.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Sidebar,
+                key: "work_surface_placement".to_string(),
+                value: settings.work_surface_placement.clone(),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -1818,7 +1846,7 @@ impl ConfigView {
         let row = self.rows.get(self.selected_row_index()?)?;
         let command = match row.key.as_str() {
             "provider" if row.editable => "/provider",
-            "model" | "default_model" if row.editable => "/model",
+            "model" if row.editable => "/model",
             _ => return None,
         };
         Some(ViewAction::Emit(ViewEvent::CommandPaletteSelected {
@@ -2277,8 +2305,9 @@ fn config_label_for_key(key: &str) -> String {
         "provider" => "Active provider",
         "base_url" => "DeepSeek API URL",
         "provider_url" => "Provider API URL",
-        "model" => "Current model",
-        "default_model" => "Default model",
+        "model" => "Active provider model",
+        "fast_model" => "Fast model (derived)",
+        "default_model" => "DeepSeek fallback model",
         "reasoning_effort" => "Reasoning level",
         "approval_mode" => "This session's permission",
         "permission_posture" => "New sessions' permission",
@@ -2292,7 +2321,7 @@ fn config_label_for_key(key: &str) -> String {
         "locale" => "Language",
         "background_color" => "Background",
         "ocean_treatment" => "Ocean treatment",
-        "work_surface_placement" => "Work surface placement",
+        "work_surface_placement" => "Sidebar position",
         "calm_mode" => "Quiet transcript",
         "low_motion" => "Reduce motion",
         "fancy_animations" => "Ocean motion",
@@ -2353,7 +2382,10 @@ fn humanize_config_key(key: &str) -> String {
 
 fn config_hint_for_key(key: &str) -> &'static str {
     match key {
-        "model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-*",
+        "model" => "provider-scoped saved route; Enter opens /model",
+        "fast_model" => {
+            "used by Auto routing and agent model_strength=faster when this provider has a known sibling"
+        }
         "provider" => "deepseek | openrouter | xiaomi-mimo | fireworks | siliconflow | ...",
         "approval_mode" => "this session only: Ask | Auto-Review | Full Access | Never",
         "permission_posture" => "default for new sessions: Ask | Auto-Review | Full Access",
@@ -2392,7 +2424,9 @@ fn config_hint_for_key(key: &str) -> &'static str {
             LOCALE_HINT.get_or_init(|| crate::localization::configured_locale_values(" | "))
         }
         "background_color" => "#RRGGBB | default",
-        "work_surface_placement" => "top | left | right",
+        "work_surface_placement" => {
+            "top | left | right · side rails require Ocean mode and at least 72 columns"
+        }
         "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
         "provider_url" => {
             "current provider endpoint; Xiaomi: token-plan | pay-as-you-go | custom URL"
@@ -2409,7 +2443,9 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "sidebar_focus" => "auto | work | tasks | agents | context | hidden",
         "max_history" => "integer (0 allowed)",
         "auto_compact_threshold_percent" => "10..=100",
-        "default_model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-* | none/default",
+        "default_model" => {
+            "DeepSeek-only legacy fallback; other providers use their provider-scoped model above"
+        }
         "reasoning_effort" => {
             "DeepSeek: auto/off/high/max; Codex: low/medium/high/xhigh; default clears saved value"
         }
@@ -2556,6 +2592,9 @@ fn config_choice_label(key: &str, value: &str) -> String {
         ("approval_mode" | "approval_policy", "never") => "Never".to_string(),
         ("default_mode", "agent") => "Agent".to_string(),
         ("default_mode", "plan") => "Plan (read only)".to_string(),
+        ("work_surface_placement", "top") => "Top".to_string(),
+        ("work_surface_placement", "left") => "Left sidebar".to_string(),
+        ("work_surface_placement", "right") => "Right sidebar".to_string(),
         ("reasoning_effort", "default") => "Provider default".to_string(),
         ("status_indicator", "cw") => "Codewhale mark".to_string(),
         ("status_indicator", "whale") => "Animated whale".to_string(),
@@ -2587,6 +2626,13 @@ fn config_choice_detail(key: &str, value: &str) -> &'static str {
         }
         ("default_mode", "agent") => "Start ready to collaborate and use tools.",
         ("default_mode", "plan") => "Start in a read-only planning workspace.",
+        ("work_surface_placement", "top") => "Show Tasks, To-do, and Workers above the transcript.",
+        ("work_surface_placement", "left") => {
+            "Show Tasks, To-do, and Workers in a left sidebar when the terminal is wide enough."
+        }
+        ("work_surface_placement", "right") => {
+            "Show Tasks, To-do, and Workers in a right sidebar when the terminal is wide enough."
+        }
         ("low_motion", "true") => "Stops decorative movement without changing model output.",
         ("low_motion", "false") => "Allows motion selected by the other appearance settings.",
         ("fancy_animations", "true") => "Animates fish, bubbles, and live ocean state.",
@@ -4317,6 +4363,9 @@ mod tests {
         assert!(!keys.contains(&"features.mcp"));
         assert!(!keys.contains(&"features.exec_policy"));
         assert!(!keys.contains(&"whaleflow"));
+        // Diagnostic-only model rows and managed permission rows are not
+        // editable; everything else outside Experimental/Fleet should be.
+        const DIAGNOSTIC_ONLY: &[&str] = &["fast_model", "default_model"];
         assert!(
             view.rows
                 .iter()
@@ -4324,7 +4373,8 @@ mod tests {
                     !matches!(
                         row.section,
                         super::ConfigSection::Experimental | super::ConfigSection::Fleet
-                    )
+                    ) && !DIAGNOSTIC_ONLY.contains(&row.key.as_str())
+                        && !row.key.starts_with("managed_")
                 })
                 .all(|row| row.editable)
         );
@@ -4339,6 +4389,12 @@ mod tests {
                 })
                 .all(|row| !row.editable)
         );
+        for key in DIAGNOSTIC_ONLY {
+            assert!(
+                view.rows.iter().any(|row| row.key == *key && !row.editable),
+                "{key} must remain diagnostic-only"
+            );
+        }
     }
 
     #[test]
@@ -4476,24 +4532,53 @@ api_key_env = "ACME_API_KEY"
     }
 
     #[test]
-    fn config_view_model_rows_use_the_full_model_picker() {
+    fn config_view_active_model_uses_picker_and_fallback_is_diagnostic_only() {
         let app = create_test_app();
-        for key in ["model", "default_model"] {
-            let mut view = ConfigView::new_for_app(&app);
-            view.selected = view
+        let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "model")
+            .expect("active model row");
+
+        match view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand { command },
+            }) => assert_eq!(command, "/model"),
+            other => panic!("expected full model picker, got {other:?}"),
+        }
+        assert!(view.editing.is_none());
+
+        for key in ["fast_model", "default_model"] {
+            let row = view
                 .rows
                 .iter()
-                .position(|row| row.key == key)
-                .expect("model row");
-
-            match view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
-                ViewAction::Emit(ViewEvent::CommandPaletteSelected {
-                    action: CommandPaletteAction::ExecuteCommand { command },
-                }) => assert_eq!(command, "/model", "row {key}"),
-                other => panic!("expected full model picker for {key}, got {other:?}"),
-            }
-            assert!(view.editing.is_none());
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"));
+            assert!(!row.editable, "{key} must be diagnostic-only");
         }
+    }
+
+    #[test]
+    fn config_view_explains_zai_fast_sibling() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Zai;
+        app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+
+        let view = ConfigView::new_for_app(&app);
+        let active = view
+            .rows
+            .iter()
+            .find(|row| row.key == "model")
+            .expect("active model row");
+        let fast = view
+            .rows
+            .iter()
+            .find(|row| row.key == "fast_model")
+            .expect("fast model row");
+
+        assert_eq!(active.value, "zai / GLM-5.2");
+        assert_eq!(fast.value, "GLM-5-Turbo");
     }
 
     #[test]
@@ -4745,7 +4830,6 @@ base_url = "https://api.xiaomimimo.com/v1"
         let mut view = ConfigView::new_for_app(&app);
 
         for (key, message_id) in [
-            ("default_model", MessageId::ConfigDefaultValue),
             ("reasoning_effort", MessageId::ConfigDefaultReasoning),
             ("background_color", MessageId::ConfigDefaultValue),
         ] {
@@ -4777,9 +4861,14 @@ base_url = "https://api.xiaomimimo.com/v1"
         assert_eq!(visible_section_labels(&view), vec!["Sidebar"]);
         assert_eq!(
             visible_row_keys(&view),
-            vec!["sidebar_width", "sidebar_focus", "context_panel"]
+            vec![
+                "work_surface_placement",
+                "sidebar_width",
+                "sidebar_focus",
+                "context_panel",
+            ]
         );
-        assert_eq!(view.rows[view.selected].key, "sidebar_width");
+        assert_eq!(view.rows[view.selected].key, "work_surface_placement");
     }
 
     #[test]
@@ -4792,7 +4881,12 @@ base_url = "https://api.xiaomimimo.com/v1"
         assert_eq!(visible_section_labels(&view), vec!["Barra lateral"]);
         assert_eq!(
             visible_row_keys(&view),
-            vec!["sidebar_width", "sidebar_focus", "context_panel"]
+            vec![
+                "work_surface_placement",
+                "sidebar_width",
+                "sidebar_focus",
+                "context_panel",
+            ]
         );
     }
 
@@ -5161,13 +5255,9 @@ base_url = "https://api.xiaomimimo.com/v1"
         let hitboxes = view.last_row_hitboxes.borrow().clone();
         let (_, row_idx) = hitboxes
             .iter()
-            .find(|(_, idx)| {
-                view.rows
-                    .get(*idx)
-                    .is_some_and(|row| row.key == "default_model")
-            })
+            .find(|(_, idx)| view.rows.get(*idx).is_some_and(|row| row.key == "model"))
             .copied()
-            .expect("default_model row should have a hitbox");
+            .expect("model row should have a hitbox");
         let y = hitboxes
             .iter()
             .find_map(|(y, idx)| (*idx == row_idx).then_some(*y))

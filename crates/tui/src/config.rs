@@ -7603,15 +7603,16 @@ fn write_config_file_secure(path: &Path, content: &str) -> Result<()> {
 /// the caller can show a confirmation message without leaking the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavedCredential {
-    /// Stored in **both** the durable secret store and the Codewhale config
-    /// file. The `backend`
-    /// label is the value of [`codewhale_secrets::Secrets::backend_name`]
-    /// at write time so the toast text can name the actual backend
-    /// (`"system keyring"`, `"file-based (~/.codewhale/secrets/)"`).
+    /// Stored in the durable secret store. The config file contains only
+    /// non-secret provider metadata and has any matching plaintext `api_key`
+    /// entry removed. The `backend` label is the value of
+    /// [`codewhale_secrets::Secrets::backend_name`] at write time so the toast
+    /// text can name the actual backend (`"system keyring"`,
+    /// `"file-based (~/.codewhale/secrets/)"`).
     KeyringAndConfigFile {
         /// `Secrets::backend_name()` at write time.
         backend: String,
-        /// Absolute path to the config file that was also updated.
+        /// Absolute path to the credential-free config metadata file.
         path: PathBuf,
     },
     /// Stored in the Codewhale config file only. Fallback when the selected
@@ -7627,7 +7628,10 @@ impl SavedCredential {
     pub fn describe(&self) -> String {
         match self {
             Self::KeyringAndConfigFile { backend, path } => {
-                format!("secret store ({backend}) and {}", path.display())
+                format!(
+                    "secret store ({backend}); credential-free config metadata in {}",
+                    path.display()
+                )
             }
             Self::ConfigFile(path) => path.display().to_string(),
         }
@@ -7636,49 +7640,44 @@ impl SavedCredential {
 
 /// Save the active provider's API key.
 ///
-/// **Dual-write strategy (#593):** writes to `~/.codewhale/config.toml`
-/// (always) and to the selected durable secret backend via
-/// [`codewhale_secrets::Secrets`] (when it is writable). Both dispatcher and
-/// standalone-TUI launches resolve `config → secret store → env`, so they
-/// observe the same saved credential.
+/// The selected durable secret backend is attempted first. On success the
+/// config keeps only non-secret auth metadata and any older plaintext copy is
+/// removed. When the secret-store write fails (OS permission denied, corrupt
+/// or read-only file backend, etc.), `config.toml` remains the headless-safe
+/// fallback and the function reports [`SavedCredential::ConfigFile`].
 ///
-/// The config file remains the inspectable durable record (works in
-/// npm installs, IDE terminals, and headless boxes alike), and the
-/// secret store supports dispatcher and direct-binary startup equally. When
-/// the secret-store write fails (OS permission denied, read-only path, etc.)
-/// the config-file write still stands and
-/// the function reports a [`SavedCredential::ConfigFile`] outcome —
-/// callers should not treat that as a failure.
-///
-/// Skipped under `cfg(test)` so the suite never touches the host
-/// keyring. The `secrets` crate has its own test coverage for
-/// keyring set/get.
+/// Under `cfg(test)` the secret-store path is enabled only when the test sets
+/// both an isolated `CODEWHALE_HOME` and an explicit backend, preventing unit
+/// tests from touching the developer's real credential store.
 pub fn save_api_key(api_key: &str) -> Result<SavedCredential> {
+    save_root_api_key_for_secret_slot(api_key, "deepseek", true)
+}
+
+fn save_root_api_key_for_secret_slot(
+    api_key: &str,
+    secret_slot: &str,
+    clear_deepseek_provider_slot: bool,
+) -> Result<SavedCredential> {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
         anyhow::bail!("Refusing to save an empty API key.");
     }
 
-    // Always write the inspectable copy first. The config file is the
-    // durable record everyone — including macOS Keychain-prompted
-    // first-run, headless CI, and IDE terminals — can rely on.
-    let path = save_api_key_to_config_file(trimmed)?;
+    let path = default_config_path()
+        .context("Failed to resolve config path: home directory not found.")?;
 
-    // Then mirror to the selected durable secret backend. Skipped under
-    // `cfg(test)` so unit tests cannot pollute the host credential store
-    // (macOS Always-Allow prompts, cross-test contamination).
-    #[cfg(not(test))]
-    {
-        let secrets = codewhale_secrets::Secrets::auto_detect();
-        match secrets.set("deepseek", trimmed) {
+    if let Some(secrets) = credential_secret_store_for_save() {
+        match secrets.set(secret_slot, trimmed) {
             Ok(()) => {
+                save_root_api_key_metadata_without_plaintext(&path, clear_deepseek_provider_slot)?;
+                codewhale_config::scrub_plaintext_api_keys_from_config_backup(&path)?;
                 let backend = secrets.backend_name().to_string();
                 log_sensitive_event(
                     "credential.save",
                     json!({
                         "backend": backend.clone(),
                         "config_path": path.display().to_string(),
-                        "dual_write": true,
+                        "plaintext_config_fallback": false,
                     }),
                 );
                 return Ok(SavedCredential::KeyringAndConfigFile { backend, path });
@@ -7690,7 +7689,56 @@ pub fn save_api_key(api_key: &str) -> Result<SavedCredential> {
         }
     }
 
+    let path = save_api_key_to_config_file(trimmed)?;
+    codewhale_config::scrub_plaintext_api_keys_from_config_backup(&path)?;
     Ok(SavedCredential::ConfigFile(path))
+}
+
+#[cfg(not(test))]
+fn credential_secret_store_for_save() -> Option<codewhale_secrets::Secrets> {
+    Some(codewhale_secrets::Secrets::auto_detect())
+}
+
+#[cfg(test)]
+fn credential_secret_store_for_save() -> Option<codewhale_secrets::Secrets> {
+    let isolated_home = std::env::var_os("CODEWHALE_HOME").is_some_and(|value| !value.is_empty());
+    let explicit_backend = std::env::var_os("CODEWHALE_SECRET_BACKEND")
+        .or_else(|| std::env::var_os("DEEPSEEK_SECRET_BACKEND"))
+        .is_some_and(|value| !value.is_empty());
+    (isolated_home && explicit_backend).then(codewhale_secrets::Secrets::auto_detect)
+}
+
+fn save_root_api_key_metadata_without_plaintext(
+    config_path: &Path,
+    clear_deepseek_provider_slot: bool,
+) -> Result<()> {
+    ensure_parent_dir(config_path)?;
+    crate::config_persistence::mutate_config_document(config_path, |doc| {
+        crate::config_persistence::set_document_value(doc, &["auth_mode"], "api_key")?;
+        if !doc.contains_key("default_text_model") {
+            crate::config_persistence::set_document_value(
+                doc,
+                &["default_text_model"],
+                DEFAULT_TEXT_MODEL,
+            )?;
+        }
+        if !doc.contains_key("reasoning_effort") {
+            crate::config_persistence::set_document_value(doc, &["reasoning_effort"], "max")?;
+        }
+        crate::config_persistence::unset_document_value(doc, &["api_key"])?;
+        if clear_deepseek_provider_slot {
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", "deepseek", "api_key"],
+            )?;
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", "deepseek-cn", "api_key"],
+            )?;
+        }
+        Ok(())
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))
 }
 
 /// Write the `api_key` slot directly to `config.toml`.
@@ -7706,7 +7754,8 @@ fn save_api_key_to_config_file(api_key: &str) -> Result<PathBuf> {
         // api_key made it skip the insert entirely; editing the document
         // replaces or inserts the real key and keeps user comments.
         crate::config_persistence::mutate_config_document(&config_path, |doc| {
-            crate::config_persistence::set_document_value(doc, &["api_key"], api_key)
+            crate::config_persistence::set_document_value(doc, &["api_key"], api_key)?;
+            crate::config_persistence::set_document_value(doc, &["auth_mode"], "api_key")
         })
         .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     } else {
@@ -7717,6 +7766,7 @@ fn save_api_key_to_config_file(api_key: &str) -> Result<PathBuf> {
 # See /links in the TUI for provider-specific credential pages.
 
 api_key = "{api_key}"
+auth_mode = "api_key"
 
 # Base URL (default: https://api.deepseek.com/beta)
 # Set https://api.deepseek.com to opt out of beta features.
@@ -8052,7 +8102,7 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
 
 pub(crate) fn save_api_key_for_identity(
     identity: &ProviderIdentity,
-    _route_config: &Config,
+    route_config: &Config,
     api_key: &str,
 ) -> Result<PathBuf> {
     let provider = identity.provider;
@@ -8064,14 +8114,21 @@ pub(crate) fn save_api_key_for_identity(
     let is_legacy_literal_custom = provider == ApiProvider::Custom
         && identity.key.trim() == ApiProvider::Custom.as_str()
         && identity.persisted_id().is_none();
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        || is_legacy_literal_custom
-    {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         return match save_api_key(api_key)? {
             SavedCredential::KeyringAndConfigFile { path, .. }
             | SavedCredential::ConfigFile(path) => Ok(path),
         };
     }
+    if is_legacy_literal_custom {
+        return match save_root_api_key_for_secret_slot(api_key, "custom", false)? {
+            SavedCredential::KeyringAndConfigFile { path, .. }
+            | SavedCredential::ConfigFile(path) => Ok(path),
+        };
+    }
+
+    let api_key = api_key.trim();
+    anyhow::ensure!(!api_key.is_empty(), "Refusing to save an empty API key.");
 
     let config_path = default_config_path()
         .context("Failed to resolve config path: home directory not found.")?;
@@ -8084,9 +8141,54 @@ pub(crate) fn save_api_key_for_identity(
     } else {
         provider_config_key(provider).context("provider api key table")?
     };
+
+    if !route_config.should_skip_secret_store_for_provider(provider)
+        && let Some(secrets) = credential_secret_store_for_save()
+    {
+        match secrets.set(provider_secret_store_slot(provider), api_key) {
+            Ok(()) => {
+                crate::config_persistence::mutate_config_document(&config_path, |doc| {
+                    crate::config_persistence::set_document_value(
+                        doc,
+                        &["providers", key_inside, "auth_mode"],
+                        "api_key",
+                    )?;
+                    crate::config_persistence::unset_document_value(
+                        doc,
+                        &["providers", key_inside, "api_key"],
+                    )?;
+                    Ok(())
+                })
+                .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+                codewhale_config::scrub_plaintext_api_keys_from_config_backup(&config_path)?;
+                log_sensitive_event(
+                    "credential.save",
+                    json!({
+                        "backend": secrets.backend_name(),
+                        "provider": identity.key,
+                        "config_path": config_path.display().to_string(),
+                        "plaintext_config_fallback": false,
+                    }),
+                );
+                return Ok(config_path);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = %identity.key,
+                    "secret-store write failed; key saved to config.toml only: {err}"
+                );
+            }
+        }
+    }
+
     // Edit the `[providers.<name>]` table in place so unrelated sections,
     // comments, and formatting survive the write.
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::set_document_value(
+            doc,
+            &["providers", key_inside, "auth_mode"],
+            "api_key",
+        )?;
         crate::config_persistence::set_document_value(
             doc,
             &["providers", key_inside, "api_key"],
@@ -8102,6 +8204,7 @@ pub(crate) fn save_api_key_for_identity(
             "config_path": config_path.display().to_string(),
         }),
     );
+    codewhale_config::scrub_plaintext_api_keys_from_config_backup(&config_path)?;
 
     Ok(config_path)
 }

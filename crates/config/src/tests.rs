@@ -3093,6 +3093,57 @@ fn config_store_save_creates_one_time_backup_before_changed_write() {
 }
 
 #[test]
+fn config_backup_strips_plaintext_api_keys_but_preserves_non_secret_auth_metadata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    let original = r#"api_key = "root-test-credential"
+default_text_model = "deepseek-v4-pro"
+
+[providers.openrouter]
+api_key = "provider-test-credential"
+api_key_env = "OPENROUTER_API_KEY"
+auth_mode = "api_key"
+"#;
+    fs::write(&path, original).expect("seed config");
+
+    let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+    store.config.default_text_model = Some("deepseek-v4-flash".to_string());
+    store.save().expect("changed save");
+
+    let backup = fs::read_to_string(config_backup_path(&path)).expect("read backup");
+    assert!(!backup.contains("root-test-credential"), "{backup}");
+    assert!(!backup.contains("provider-test-credential"), "{backup}");
+    assert!(
+        !backup
+            .lines()
+            .any(|line| line.trim_start().starts_with("api_key ="))
+    );
+    assert!(backup.contains("api_key_env = \"OPENROUTER_API_KEY\""));
+    assert!(backup.contains("auth_mode = \"api_key\""));
+    assert!(backup.contains("default_text_model = \"deepseek-v4-pro\""));
+}
+
+#[test]
+fn config_backup_scrub_repairs_an_existing_plaintext_backup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(&path, "model = \"new-model\"\n").expect("seed config");
+    let backup_path = config_backup_path(&path);
+    fs::write(
+        &backup_path,
+        "api_key = \"old-test-credential\"\nmodel = \"old-model\"\n",
+    )
+    .expect("seed backup");
+
+    scrub_plaintext_api_keys_from_config_backup(&path).expect("scrub backup");
+
+    let backup = fs::read_to_string(backup_path).expect("read backup");
+    assert!(!backup.contains("old-test-credential"), "{backup}");
+    assert!(!backup.contains("api_key"), "{backup}");
+    assert!(backup.contains("model = \"old-model\""));
+}
+
+#[test]
 fn config_store_save_preserves_comments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join(CONFIG_FILE_NAME);

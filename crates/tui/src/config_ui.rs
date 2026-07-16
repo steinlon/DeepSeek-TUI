@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
 #[cfg(feature = "web")]
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::commands;
-use crate::config::{Config, StatusItem, normalize_model_name};
+use crate::config::{Config, StatusItem, normalize_model_name_for_provider, validate_route};
 use crate::localization::{normalize_configured_locale, resolve_locale};
 use crate::settings::Settings;
 use crate::tui::app::{
@@ -40,6 +41,11 @@ pub struct ConfigUiDocument {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct RuntimeSection {
+    #[schemars(
+        title = "Active provider",
+        description = "Informational route identity. Switch providers with /provider before opening this editor."
+    )]
+    pub provider: String,
     #[schemars(title = "Current model")]
     pub model: String,
     pub approval_mode: ApprovalModeValue,
@@ -90,6 +96,11 @@ pub struct SettingsSection {
         description = "Follow symbolic links during workspace file discovery walks. Enable for symlink-based multi-project workspaces."
     )]
     pub workspace_follow_symlinks: bool,
+    #[schemars(
+        title = "Provider model overrides",
+        description = "Saved TUI model selection for each provider identity. The active provider's entry follows Current model."
+    )]
+    pub provider_models: BTreeMap<String, String>,
     pub default_model: Option<String>,
 }
 
@@ -343,6 +354,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
     let status_items = app.status_items.iter().copied().map(Into::into).collect();
     Ok(ConfigUiDocument {
         runtime: RuntimeSection {
+            provider: app.provider_identity_for_persistence().to_string(),
             model: app.model.clone(),
             approval_mode: app.approval_mode.into(),
         },
@@ -377,6 +389,12 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             cost_currency: CostCurrencyValue::from_setting(&settings.cost_currency)?,
             prefer_external_pdftotext: settings.prefer_external_pdftotext,
             workspace_follow_symlinks: settings.workspace_follow_symlinks,
+            provider_models: settings
+                .provider_models
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             default_model,
         },
         config: ConfigSection {
@@ -392,6 +410,10 @@ pub fn build_schema() -> Value {
     schema["title"] = Value::String("codewhale Config".to_string());
     schema["description"] =
         Value::String("Edit runtime and persisted TUI configuration.".to_string());
+    // Provider switching is asynchronous and owns client preflight, so this
+    // editor shows the route identity only as validation context. `/provider`
+    // remains the sole provider-switch surface.
+    schema["$defs"]["RuntimeSection"]["properties"]["provider"]["readOnly"] = Value::Bool(true);
     schema
 }
 
@@ -503,7 +525,7 @@ pub fn apply_document(
     config: &mut Config,
     persist: bool,
 ) -> Result<ConfigUiApplyOutcome> {
-    validate_document(&doc)?;
+    validate_document(&doc, app, config)?;
     let mut notes = Vec::new();
     let previous_compaction = app.compaction_config();
     let previous_reasoning_effort = app.reasoning_effort;
@@ -619,6 +641,29 @@ pub fn apply_document(
         if let Some(message) = result.message {
             notes.push(message);
         }
+
+        // `/model` and the schema-driven config editor share one durable
+        // provider-scoped model map. `set_config_value("model", ...)` owns the
+        // live App mutation, while this block persists that selection without
+        // rewriting the DeepSeek-only global fallback (#3227).
+        let mut settings = Settings::load_persisted()?;
+        let mut provider_models = doc
+            .settings
+            .provider_models
+            .iter()
+            .map(|(provider, model)| (provider.clone(), model.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        provider_models.insert(
+            app.provider_identity_for_persistence().to_string(),
+            app.model_selection_for_persistence(),
+        );
+        settings.provider_models = (!provider_models.is_empty()).then_some(provider_models);
+        settings.save()?;
+        notes.push(format!(
+            "{} model saved for {}",
+            app.model_display_label(),
+            app.provider_identity_for_persistence()
+        ));
     }
 
     apply_reasoning_effort(app, config, doc.config.reasoning_effort, persist)?;
@@ -667,11 +712,26 @@ pub fn open_browser(url: &str) -> Result<()> {
     crate::utils::open_url(url)
 }
 
-fn validate_document(doc: &ConfigUiDocument) -> Result<()> {
-    if !doc.runtime.model.trim().eq_ignore_ascii_case("auto")
-        && normalize_model_name(&doc.runtime.model).is_none()
+fn validate_document(doc: &ConfigUiDocument, app: &App, config: &Config) -> Result<()> {
+    let document_identity = config
+        .resolve_provider_identity(&doc.runtime.provider)
+        .map_err(anyhow::Error::msg)?;
+    if document_identity.provider != app.api_provider
+        || document_identity.key != app.provider_identity_for_persistence()
     {
-        bail!("invalid model '{}'", doc.runtime.model);
+        bail!(
+            "provider changed from '{}' to '{}' while editing; switch providers with /provider, then reopen /config",
+            app.provider_identity_for_persistence(),
+            doc.runtime.provider
+        );
+    }
+    validate_and_normalize_model(app.api_provider, &doc.runtime.model)?;
+    for (provider_id, model) in &doc.settings.provider_models {
+        let identity = config
+            .resolve_provider_identity(provider_id)
+            .map_err(anyhow::Error::msg)?;
+        validate_and_normalize_model(identity.provider, model)
+            .map_err(|err| anyhow::anyhow!("invalid provider_models.{provider_id} value: {err}"))?;
     }
     if doc.config.mcp_config_path.trim().is_empty() {
         bail!("mcp_config_path cannot be empty");
@@ -679,12 +739,43 @@ fn validate_document(doc: &ConfigUiDocument) -> Result<()> {
     Ok(())
 }
 
+fn validate_and_normalize_model(
+    provider: crate::config::ApiProvider,
+    model: &str,
+) -> Result<String> {
+    let model = model.trim();
+    validate_route(provider, model).map_err(anyhow::Error::msg)?;
+    if model.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+    normalize_model_name_for_provider(provider, model).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid model '{model}' for provider '{}'",
+            provider.as_str()
+        )
+    })
+}
+
 fn reload_runtime_config(app: &mut App, config: &mut Config) -> Result<()> {
     let reloaded = Config::load(app.config_path.clone(), app.config_profile.as_deref())?;
     *config = reloaded.clone();
-    let identity = reloaded
-        .active_provider_identity(reloaded.api_provider())
-        .map_err(anyhow::Error::msg)?;
+    // Match App startup precedence: an explicit config provider wins, while a
+    // config with no provider keeps the saved TUI provider. Reloading an
+    // unrelated setting must never pair a Z.ai model with DeepSeek merely
+    // because `Config::default()` is DeepSeek.
+    let settings = Settings::load_persisted().unwrap_or_default();
+    let identity = if reloaded
+        .provider
+        .as_deref()
+        .is_some_and(|provider| !provider.trim().is_empty())
+    {
+        reloaded.active_provider_identity(reloaded.api_provider())
+    } else if let Some(provider) = settings.default_provider.as_deref() {
+        reloaded.resolve_provider_identity(provider)
+    } else {
+        reloaded.active_provider_identity(reloaded.api_provider())
+    }
+    .map_err(anyhow::Error::msg)?;
     app.set_provider_identity_record(identity);
     app.reasoning_effort =
         ReasoningEffort::from_setting(reloaded.reasoning_effort().unwrap_or_else(|| {
@@ -696,7 +787,7 @@ fn reload_runtime_config(app: &mut App, config: &mut Config) -> Result<()> {
     app.update_model_compaction_budget();
     app.mcp_config_path = reloaded.mcp_config_path();
     app.skills_dir = reloaded.skills_dir();
-    app.ui_locale = resolve_locale(&Settings::load_persisted().unwrap_or_default().locale);
+    app.ui_locale = resolve_locale(&settings.locale);
     Ok(())
 }
 
@@ -1291,6 +1382,10 @@ background_color = "#1A1B26"
     #[test]
     fn schema_contains_typed_enums() {
         let schema = build_schema();
+        assert_eq!(
+            schema["$defs"]["RuntimeSection"]["properties"]["provider"]["readOnly"],
+            serde_json::json!(true)
+        );
         let approval_mode = &schema["$defs"]["ApprovalModeValue"]["enum"];
         assert_eq!(
             approval_mode,
@@ -1385,6 +1480,115 @@ mcp_config_path = "disk-mcp.json"
             Some("disk-mcp.json"),
             "session-only apply must not reload persisted config back into runtime state"
         );
+    }
+
+    #[test]
+    fn zai_document_persists_provider_model_without_changing_deepseek_fallback() {
+        let _lock = lock_test_env();
+        let temp_root = tempfile::tempdir().expect("isolated config dir");
+        let state_dir = temp_root.path().join(".deepseek");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let config_path = state_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"default_text_model = "deepseek-v4-pro"
+mcp_config_path = "mcp.json"
+
+[providers.zai]
+model = "GLM-5.2"
+"#,
+        )
+        .expect("seed config");
+        fs::write(
+            state_dir.join("settings.toml"),
+            r#"default_provider = "zai"
+default_model = "deepseek-v4-pro"
+
+[provider_models]
+zai = "GLM-5.2"
+"#,
+        )
+        .expect("seed settings");
+
+        let old_config_path = std::env::var_os("DEEPSEEK_CONFIG_PATH");
+        unsafe {
+            std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
+        }
+
+        let mut config = Config::load(Some(config_path.clone()), None).expect("load config");
+        let mut app = app();
+        app.config_path = Some(config_path.clone());
+        app.set_provider_identity_record(
+            config
+                .active_provider_identity(ApiProvider::Zai)
+                .expect("Z.ai identity"),
+        );
+        app.set_model_selection("GLM-5.2".to_string());
+
+        let mut doc = build_document(&app, &config).expect("document");
+        assert_eq!(doc.runtime.provider, "zai");
+        assert_eq!(doc.runtime.model, "GLM-5.2");
+        assert_eq!(
+            doc.settings.provider_models.get("zai").map(String::as_str),
+            Some("GLM-5.2")
+        );
+        doc.runtime.model = "glm-5-turbo".to_string();
+
+        let outcome = apply_document(doc, &mut app, &mut config, true).expect("apply Z.ai model");
+        assert!(outcome.changed);
+        assert!(outcome.requires_engine_sync);
+        assert_eq!(app.api_provider, ApiProvider::Zai);
+        assert_eq!(app.model, "GLM-5-Turbo");
+
+        let settings = Settings::load_persisted().expect("persisted settings");
+        assert_eq!(
+            settings
+                .provider_models
+                .as_ref()
+                .and_then(|models| models.get("zai"))
+                .map(String::as_str),
+            Some("GLM-5-Turbo")
+        );
+        assert_eq!(settings.default_model.as_deref(), Some("deepseek-v4-pro"));
+        let persisted = fs::read_to_string(&config_path).expect("persisted config");
+        let persisted: toml::Value = toml::from_str(&persisted).expect("parse persisted config");
+        assert_eq!(
+            persisted["default_text_model"].as_str(),
+            Some("deepseek-v4-pro")
+        );
+
+        unsafe {
+            if let Some(value) = old_config_path {
+                std::env::set_var("DEEPSEEK_CONFIG_PATH", value);
+            } else {
+                std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn zai_document_rejects_a_deepseek_model_before_mutating_app() {
+        let mut config = Config {
+            provider: Some("zai".to_string()),
+            ..Config::default()
+        };
+        let mut app = app();
+        app.set_provider_identity(ApiProvider::Zai, "zai");
+        app.set_model_selection("GLM-5.2".to_string());
+        let mut doc = build_document(&app, &config).expect("document");
+        doc.settings.provider_models.clear();
+        doc.runtime.model = "deepseek-v4-flash".to_string();
+
+        let error = apply_document(doc, &mut app, &mut config, false)
+            .expect_err("foreign model must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not compatible with provider 'zai'")
+        );
+        assert_eq!(app.api_provider, ApiProvider::Zai);
+        assert_eq!(app.model, "GLM-5.2");
     }
 
     #[test]

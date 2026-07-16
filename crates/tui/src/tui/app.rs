@@ -17,8 +17,8 @@ use crate::artifacts::ArtifactRecord;
 use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key, has_api_key_for,
-    save_api_key, save_api_key_for,
+    ApiProvider, ApprovalPolicyControl, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key,
+    has_api_key_for, save_api_key, save_api_key_for,
 };
 use crate::config_ui::ConfigUiMode;
 use crate::core::authority::{ModeSessionPrefs, base_policy_for_mode};
@@ -2060,6 +2060,10 @@ pub struct App {
     /// True when config/requirements supplied an approval policy. In that
     /// case the TUI-only Shift+Tab preference must not loosen it.
     approval_policy_locked: bool,
+    /// True only when the controlling policy is the user's editable root
+    /// config.toml key. An explicit Shift+Tab may migrate that key to the
+    /// durable TUI posture; higher-precedence sources remain immutable.
+    approval_policy_root_editable: bool,
     /// True only when an organization requirements file owns approval policy.
     /// Unlike a user-owned config key, this source cannot be edited in-app.
     approval_policy_requirements_managed: bool,
@@ -2889,9 +2893,20 @@ impl App {
             .then_some(config.approval_policy.as_deref())
             .flatten()
             .and_then(ApprovalMode::from_config_value);
-        let approval_policy_locked =
-            !legacy_yolo_full_access && config.approval_policy_is_managed();
-        let approval_policy_requirements_managed = config.approval_policy_is_requirements_managed();
+        let approval_policy_control = if legacy_yolo_full_access {
+            ApprovalPolicyControl::Unset
+        } else {
+            config.approval_policy_control(
+                config_path.as_deref(),
+                config_profile.as_deref(),
+                &workspace,
+            )
+        };
+        let approval_policy_locked = approval_policy_control != ApprovalPolicyControl::Unset;
+        let approval_policy_root_editable =
+            approval_policy_control == ApprovalPolicyControl::RootConfig;
+        let approval_policy_requirements_managed =
+            approval_policy_control == ApprovalPolicyControl::Requirements;
         let saved_permission_posture = if approval_policy_locked {
             None
         } else {
@@ -3142,6 +3157,7 @@ impl App {
             keybinding_migration_notified: false,
             mode_prefs,
             approval_policy_locked,
+            approval_policy_root_editable,
             approval_policy_requirements_managed,
             clipboard: ClipboardHandler::new(),
             approval_session_approved: HashSet::new(),
@@ -3538,18 +3554,9 @@ impl App {
 
     /// Cycle the durable Agent permission posture: Ask → Auto-Review → Bypass.
     pub fn cycle_approval_posture(&mut self) -> bool {
-        if self.reject_setting_change_while_busy("Permissions") {
+        let Some(next) = self.next_approval_posture(false) else {
             return false;
-        }
-        if self.mode == AppMode::Plan {
-            self.push_status_toast(
-                "Plan is Read Only; switch to Act to change permissions".to_string(),
-                StatusToastLevel::Info,
-                Some(5_000),
-            );
-            self.needs_redraw = true;
-            return false;
-        }
+        };
         if self.approval_policy_locked() {
             self.push_status_toast(
                 "Permissions are controlled by config or managed requirements".to_string(),
@@ -3559,19 +3566,7 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
-        let next = self.mode_prefs.agent_approval_mode.cycle_permission_next();
-        let persisted = match next {
-            ApprovalMode::Suggest => "ask",
-            ApprovalMode::Auto => "auto-review",
-            ApprovalMode::Bypass => "full-access",
-            ApprovalMode::Never => "never",
-        };
-        let persistence_result = (|| -> anyhow::Result<()> {
-            let mut settings = Settings::load_persisted()?;
-            settings.permission_posture = Some(persisted.to_string());
-            settings.save()
-        })();
-        if let Err(err) = persistence_result {
+        if let Err(err) = Self::persist_permission_posture(next) {
             self.push_status_toast(
                 format!("Permissions were not changed: could not save TUI posture ({err})"),
                 StatusToastLevel::Warning,
@@ -3580,12 +3575,116 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
+        self.finish_approval_posture_change(next);
+        true
+    }
+
+    /// Cycle permissions when the only controlling source is the user's
+    /// editable root `config.toml` key. Shift+Tab is an explicit request to
+    /// adopt the TUI posture, so persist the next setting first, then remove
+    /// the shadowing root key. Roll back the setting if that removal fails.
+    pub fn cycle_root_approval_posture(&mut self) -> bool {
+        let Some(next) = self.next_approval_posture(true) else {
+            return false;
+        };
+        if !self.approval_policy_root_editable {
+            self.push_status_toast(
+                "Permissions are controlled by a non-editable policy source".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+
+        let mut settings = match Settings::load_persisted() {
+            Ok(settings) => settings,
+            Err(err) => {
+                self.push_status_toast(
+                    format!("Permissions were not changed: could not load TUI settings ({err})"),
+                    StatusToastLevel::Warning,
+                    Some(8_000),
+                );
+                return false;
+            }
+        };
+        let previous = settings.permission_posture.clone();
+        settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
+        if let Err(err) = settings.save() {
+            self.push_status_toast(
+                format!("Permissions were not changed: could not save TUI posture ({err})"),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            return false;
+        }
+
+        let active_config_path = crate::config::resolve_load_config_path(self.config_path.clone());
+        if let Err(err) = crate::config_persistence::persist_unset_root_key(
+            active_config_path.as_deref(),
+            "approval_policy",
+        ) {
+            settings.permission_posture = previous;
+            let rollback = settings.save().err();
+            let rollback_note = rollback
+                .map(|rollback| format!("; settings rollback also failed: {rollback}"))
+                .unwrap_or_default();
+            self.push_status_toast(
+                format!(
+                    "Permissions were not changed: could not release root config policy ({err}){rollback_note}"
+                ),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+
+        self.clear_saved_approval_policy_lock();
+        self.finish_approval_posture_change(next);
+        true
+    }
+
+    fn next_approval_posture(&mut self, allow_root_policy: bool) -> Option<ApprovalMode> {
+        if self.reject_setting_change_while_busy("Permissions") {
+            return None;
+        }
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                "Plan is Read Only; switch to Act to change permissions".to_string(),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+            self.needs_redraw = true;
+            return None;
+        }
+        if allow_root_policy && !self.approval_policy_root_editable {
+            return None;
+        }
+        Some(self.mode_prefs.agent_approval_mode.cycle_permission_next())
+    }
+
+    fn approval_posture_setting(mode: ApprovalMode) -> &'static str {
+        match mode {
+            ApprovalMode::Suggest => "ask",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Never => "never",
+        }
+    }
+
+    fn persist_permission_posture(next: ApprovalMode) -> anyhow::Result<()> {
+        let mut settings = Settings::load_persisted()?;
+        settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
+        settings.save()
+    }
+
+    fn finish_approval_posture_change(&mut self, next: ApprovalMode) {
         self.set_agent_approval_posture(next);
         self.needs_redraw = true;
         // Footer permission chip is canonical — no status toast for the new
         // value, only the one-shot rebinding notice.
         self.notify_keybinding_migration_once();
-        true
     }
 
     /// Replace the complete durable Act baseline and project it onto the live
@@ -3679,11 +3778,13 @@ impl App {
 
     pub fn mark_approval_policy_locked(&mut self) {
         self.approval_policy_locked = true;
+        self.approval_policy_root_editable = true;
     }
 
     pub fn clear_saved_approval_policy_lock(&mut self) {
         if !self.approval_policy_requirements_managed {
             self.approval_policy_locked = false;
+            self.approval_policy_root_editable = false;
         }
     }
 

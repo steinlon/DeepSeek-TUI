@@ -2,13 +2,13 @@
 
 use super::CommandResult;
 use crate::config::{
-    ApiProvider, COMMON_DEEPSEEK_MODELS, Config, DEFAULT_STREAM_CHUNK_TIMEOUT_SECS,
-    DEFAULT_SUBAGENT_API_TIMEOUT_SECS, DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
-    DEFAULT_XIAOMI_MIMO_BASE_URL, MAX_STREAM_CHUNK_TIMEOUT_SECS, MAX_SUBAGENT_API_TIMEOUT_SECS,
+    ApiProvider, Config, DEFAULT_STREAM_CHUNK_TIMEOUT_SECS, DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
+    DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_XIAOMI_MIMO_BASE_URL,
+    MAX_STREAM_CHUNK_TIMEOUT_SECS, MAX_SUBAGENT_API_TIMEOUT_SECS,
     MAX_SUBAGENT_HEARTBEAT_TIMEOUT_SECS, MAX_SUBAGENTS, MIN_STREAM_CHUNK_TIMEOUT_SECS,
     MIN_SUBAGENT_API_TIMEOUT_SECS, MIN_SUBAGENT_HEARTBEAT_TIMEOUT_SECS, SubagentsConfig,
     XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL, clear_active_provider_api_key,
-    normalize_model_name_for_provider,
+    normalize_model_name_for_provider, validate_route,
 };
 use crate::config_persistence::{
     persist_provider_base_url_key, persist_root_bool_key, persist_root_string_key,
@@ -1416,10 +1416,13 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             // Clear auto mode when a specific model is set
             let Some(model) = normalize_model_name_for_provider(app.api_provider, value) else {
                 return CommandResult::error(format!(
-                    "Invalid model '{value}'. Expected a DeepSeek model ID. Common models: {}",
-                    COMMON_DEEPSEEK_MODELS.join(", ")
+                    "Invalid model '{value}' for provider {}.",
+                    app.api_provider.as_str()
                 ));
             };
+            if let Err(reason) = validate_route(app.api_provider, &model) {
+                return CommandResult::error(reason);
+            }
             app.set_model_selection(model.clone());
             app.update_model_compaction_budget();
             app.session.last_prompt_tokens = None;
@@ -1755,6 +1758,19 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         Err(e) => return CommandResult::error(format!("Failed to load settings: {e}")),
     };
 
+    if key == "default_model"
+        && !matches!(
+            app.api_provider,
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN
+        )
+        && !persist
+    {
+        return CommandResult::error(format!(
+            "default_model is the DeepSeek startup fallback and cannot change the active {} session. Use /model for the current provider, or add --save to change only future DeepSeek sessions.",
+            app.api_provider.as_str()
+        ));
+    }
+
     if let Err(e) = settings.set(&key, value) {
         return CommandResult::error(format!("{e}"));
     }
@@ -1922,7 +1938,11 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.max_input_history = settings.max_input_history;
         }
         "default_model" => {
-            if let Some(ref model) = settings.default_model {
+            if matches!(
+                app.api_provider,
+                ApiProvider::Deepseek | ApiProvider::DeepseekCN
+            ) && let Some(ref model) = settings.default_model
+            {
                 app.set_model_selection(model.clone());
                 if app.auto_model {
                     app.reasoning_effort = ReasoningEffort::Auto;
@@ -1987,7 +2007,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         _ => value.to_string(),
     };
 
-    let message = if persist {
+    let mut message = if persist {
         if let Err(e) = settings.save() {
             return CommandResult::error(format!("Failed to save: {e}"));
         }
@@ -1995,6 +2015,18 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     } else {
         format!("{key} = {display_value} (session only, add --save to persist)")
     };
+    if key == "default_model"
+        && !matches!(
+            app.api_provider,
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN
+        )
+    {
+        message.push_str(&format!(
+            "; DeepSeek fallback only — active {}/{} is unchanged",
+            app.api_provider.as_str(),
+            app.model_display_label()
+        ));
+    }
 
     CommandResult {
         message: Some(message),
@@ -2876,6 +2908,26 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
     }
 
     #[test]
+    fn config_model_rejects_foreign_model_for_direct_provider() {
+        let mut app = create_test_app();
+        app.api_provider = ApiProvider::Zai;
+        app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+
+        let result = set_config_value(&mut app, "model", "deepseek-v4-pro", false);
+
+        assert!(result.is_error);
+        assert_eq!(app.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert!(result.action.is_none());
+        let message = result.message.as_deref().expect("rejection message");
+        assert!(
+            message.contains("not compatible with provider 'zai'")
+                || message.contains("not served by direct provider zai"),
+            "unexpected rejection message: {message}"
+        );
+        assert!(message.contains("deepseek-v4-pro"), "{message}");
+    }
+
+    #[test]
     fn config_model_auto_enables_auto_thinking() {
         let mut app = create_test_app();
         app.reasoning_effort = ReasoningEffort::Off;
@@ -2888,6 +2940,49 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         assert_eq!(app.reasoning_effort, ReasoningEffort::Auto);
         assert!(app.last_effective_model.is_none());
         assert!(app.last_effective_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn config_default_model_cannot_replace_a_non_deepseek_live_route() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-provider-scoped-default-model-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let mut app = create_test_app();
+        app.api_provider = ApiProvider::Zai;
+        app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+        app.auto_model = false;
+
+        let session_only = set_config_value(&mut app, "default_model", "deepseek-v4-flash", false);
+
+        assert!(session_only.is_error);
+        assert_eq!(app.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert!(session_only.action.is_none());
+        assert!(
+            session_only
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("DeepSeek startup fallback"))
+        );
+
+        let saved = set_config_value(&mut app, "default_model", "deepseek-v4-flash", true);
+
+        assert!(!saved.is_error);
+        assert_eq!(app.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert!(saved.action.is_none());
+        assert!(
+            saved
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("active zai/GLM-5.2 is unchanged"))
+        );
+        let persisted = Settings::load_persisted().expect("saved settings");
+        assert_eq!(
+            persisted.default_model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
     }
 
     #[test]

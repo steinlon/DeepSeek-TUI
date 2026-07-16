@@ -62,6 +62,10 @@ pub fn handle_nav_key(
     match key.code {
         KeyCode::Esc => controller.request_cancel(),
         KeyCode::Enter => controller.request_commit(),
+        KeyCode::BackTab => {
+            controller.prev_tab();
+            PickerNavResult::Preview
+        }
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
             controller.prev_tab();
             PickerNavResult::Preview
@@ -371,6 +375,21 @@ mod tests {
         );
         assert_eq!(result, PickerNavResult::None);
         assert_eq!(controller.selected_id().map(str::to_string), before);
+    }
+
+    #[test]
+    fn backtab_uses_the_same_previous_tab_path_as_shift_tab() {
+        let mut controller = SettingsPickerController::new(sample_options(), "system");
+        assert_eq!(controller.active_tab(), 0);
+
+        let result = handle_nav_key(
+            &mut controller,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            false,
+        );
+
+        assert_eq!(result, PickerNavResult::Preview);
+        assert_eq!(controller.active_tab(), controller.tabs().len() - 1);
     }
 
     #[test]
