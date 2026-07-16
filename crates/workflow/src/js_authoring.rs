@@ -680,6 +680,25 @@ workflow({
                         && leaf.prompt.contains("do not call `read_file`"),
                     "the scout must finish discovery in one bounded tool round"
                 );
+                assert_eq!(
+                    leaf.file_scope
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "fleets/stopship.toml",
+                        "crates/cli/src/lib.rs",
+                        "crates/workflow/src/role_resolve.rs",
+                        "crates/tui/src/tools/workflow.rs",
+                    ],
+                    "the scout grep must not include its own authored prompt"
+                );
+                assert!(
+                    leaf.prompt.contains(
+                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`]"
+                    ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
+                    "the one grep must constrain the actual tool input, not only File scope metadata"
+                );
                 assert!(
                     leaf.prompt.contains("if you can populate all six")
                         && leaf
@@ -730,19 +749,21 @@ workflow({
         );
 
         let expected_gates = [
-            ("scout", "implementer"),
-            ("implementer", "reviewer"),
-            ("reviewer", "verifier"),
-            ("verifier", "release_lead"),
+            ("scout", Some("implementer"), "source_evidence"),
+            ("implementer", Some("reviewer"), "verification_plan"),
+            ("reviewer", Some("verifier"), "review_report"),
+            ("verifier", Some("release_lead"), "verification_report"),
+            ("release_lead", None, "final_receipt"),
         ];
         assert_eq!(workflow.gates.len(), expected_gates.len());
-        for (gate, (role, blocked_role)) in workflow.gates.iter().zip(expected_gates) {
+        for (gate, (role, blocked_role, artifact_kind)) in workflow.gates.iter().zip(expected_gates)
+        {
             assert_eq!(gate.role, role);
             assert_eq!(gate.on, GateOn::RoleComplete);
             assert_eq!(gate.on_fail, GateOnFail::Block);
-            assert_eq!(gate.blocks_role.as_deref(), Some(blocked_role));
+            assert_eq!(gate.blocks_role.as_deref(), blocked_role);
             assert_eq!(gate.max_retries, 0);
-            assert!(gate.artifact_kind.is_some());
+            assert_eq!(gate.artifact_kind.as_deref(), Some(artifact_kind));
             assert!(
                 gate.require_explicit_verdict,
                 "{role} gate must fail closed when its verdict is missing or malformed"

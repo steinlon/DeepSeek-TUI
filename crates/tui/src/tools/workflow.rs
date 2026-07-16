@@ -839,7 +839,14 @@ async fn run_workflow_vm(
     let mut output = None;
     let mut error = None;
     match result {
-        Ok(value) => output = Some(value),
+        Ok(value) => {
+            if let Some(gate_error) = driver.terminal_gate_failure() {
+                status = WorkflowRunStatus::Failed;
+                error = Some(gate_error);
+            } else {
+                output = Some(value);
+            }
+        }
         Err(err) => {
             status = WorkflowRunStatus::Failed;
             error = Some(err.to_string());
@@ -1863,8 +1870,11 @@ fn has_gate_artifact_body(output: Option<&str>) -> bool {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty());
+    // A declared artifact needs both a body label and at least one concrete
+    // entry after the verdict. This keeps `APPROVE\nok` from promoting a
+    // placeholder while remaining format-agnostic for arbitrary artifact kinds.
     meaningful_lines.next();
-    meaningful_lines.next().is_some()
+    meaningful_lines.next().is_some() && meaningful_lines.next().is_some()
 }
 
 fn gate_outcome_for_completed_role(
@@ -2041,6 +2051,32 @@ impl SubAgentWorkflowDriver {
             total: self.total_budget,
             spent,
         }
+    }
+
+    /// Return the first authoritative gate failure after the VM has no more
+    /// children to admit. Intermediate blocks already reject the downstream
+    /// spawn; this final check gives a terminal role's BLOCK verdict the same
+    /// fail-closed semantics.
+    fn terminal_gate_failure(&self) -> Option<String> {
+        let board = match self.gate_board.lock() {
+            Ok(board) => board,
+            Err(_) => {
+                return Some(
+                    "workflow gate board was unavailable during terminal finalization".to_string(),
+                );
+            }
+        };
+        self.gate_specs.iter().find_map(|spec| {
+            let state = board.gates.get(&spec.id)?;
+            state.is_blocking().then(|| {
+                format!(
+                    "workflow gate `{}` ended {}: {}",
+                    spec.id,
+                    state.as_str(),
+                    gate_state_reason(state)
+                )
+            })
+        })
     }
 
     fn record_run_event(&self, event: WorkflowUiEvent) {
@@ -4987,7 +5023,7 @@ reviewer = "reviewer"
     }
 
     #[test]
-    fn required_gate_artifact_rejects_bare_approval() {
+    fn required_gate_artifact_rejects_bare_or_placeholder_approval() {
         let mut record = RuntimeTaskRecord {
             agent_id: "implementer-bare".to_string(),
             label: Some("implementer".to_string()),
@@ -5007,11 +5043,105 @@ reviewer = "reviewer"
             outcome => panic!("bare approval must not promote an empty artifact: {outcome:?}"),
         }
 
+        record.output = Some("APPROVE\nacceptance evidence".to_string());
+        match gate_outcome_for_completed_role(&record, true, Some("verification_plan")) {
+            GateOutcome::Fail { reason } => {
+                assert!(
+                    reason.contains("verification_plan artifact body"),
+                    "{reason}"
+                );
+            }
+            outcome => {
+                panic!("one placeholder line must not count as an artifact: {outcome:?}");
+            }
+        }
+
         record.output = Some("APPROVE\nPLAN\n- verify the typed receipt".to_string());
         assert_eq!(
             gate_outcome_for_completed_role(&record, true, Some("verification_plan")),
             GateOutcome::Pass
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn terminal_blocked_gate_fails_workflow_finalization() {
+        let _retry_guard = workflow_test_retry_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let (client, calls) =
+            fake_chat_client("BLOCK\nFINAL RECEIPT\n- missing terminal evidence").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager,
+        );
+        let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
+
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": r#"export default workflow({
+                        "goal": "fail closed on the terminal release verdict",
+                        "gates": [
+                            {
+                                "id": "terminal-release",
+                                "role": "release_lead",
+                                "on": "role_complete",
+                                "gate": "approve",
+                                "on_fail": "block",
+                                "max_retries": 0,
+                                "artifact_kind": "final_receipt",
+                                "require_explicit_verdict": true
+                            }
+                        ],
+                        "nodes": [
+                            {
+                                "agent": {
+                                    "id": "release-receipt",
+                                    "prompt": "Return the terminal verdict and receipt.",
+                                    "agent_type": "general",
+                                    "role": "release_lead",
+                                    "mode": "read_only",
+                                    "permissions": { "deny_all_tools": true },
+                                    "budget": { "max_steps": 1 }
+                                }
+                            }
+                        ]
+                    });"#
+                }),
+                &ctx,
+            )
+            .await
+            .expect("blocked terminal gate should return its failed run record");
+        let payload: Value = serde_json::from_str(&result.content).expect("workflow JSON");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{payload}");
+        assert_eq!(payload["status"], "failed", "{payload}");
+        assert_eq!(payload["execution"]["status"], "failed", "{payload}");
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("terminal-release")
+                    && error.contains("ended blocked")
+                    && error.contains("missing terminal evidence")),
+            "{payload}"
+        );
+        assert!(payload["gate_status"].as_array().is_some_and(|gates| {
+            gates
+                .iter()
+                .any(|gate| gate["gate_id"] == "terminal-release" && gate["state"] == "blocked")
+        }));
+        assert!(payload["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["type"] == "run_completed" && event["status"] == "failed")
+        }));
     }
 
     #[tokio::test]
@@ -5108,7 +5238,7 @@ reviewer = "reviewer"
             label: Some("reviewer".to_string()),
             role: Some("reviewer".to_string()),
             status: IrWorkflowRunStatus::Succeeded,
-            output: Some("APPROVE\nall receipt owners confirmed".to_string()),
+            output: Some("APPROVE\nEVIDENCE REVIEW\n- all receipt owners confirmed".to_string()),
             schema_error: None,
         });
 
@@ -5452,7 +5582,40 @@ reviewer = "reviewer"
 
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 8);
-        let (client, calls) = fake_chat_client("APPROVE\nacceptance evidence").await;
+        let responses = [
+            r#"APPROVE
+SOURCE EVIDENCE
+- crates/cli/src/lib.rs: load_named_fleet
+- crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- crates/cli/src/lib.rs: start_lane
+- crates/tui/src/tools/workflow.rs: record_task_started
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted"#,
+            r#"APPROVE
+PLAN
+- crates/workflow/src/role_resolve.rs: resolve_workflow_agent -> role resolution
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated -> gate promotion
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal reconciliation"#,
+            r#"APPROVE
+EVIDENCE REVIEW
+- crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- crates/tui/src/tools/workflow.rs: record_task_started
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted"#,
+            r#"APPROVE
+EVIDENCE MATRIX
+- task_started: crates/tui/src/tools/workflow.rs: record_task_started
+- gate_updated: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
+- metadata: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- lane_exit: crates/cli/src/lib.rs: start_lane"#,
+            r#"APPROVE
+FINAL RECEIPT
+- declared role and resolved profile: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
+- gate states: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
+- terminal status: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted"#,
+        ];
+        let (client, calls) = fake_chat_client_responses(&responses).await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -5517,12 +5680,14 @@ reviewer = "reviewer"
             .iter()
             .filter(|event| event["type"] == "gate_updated")
             .collect::<Vec<_>>();
-        assert_eq!(gates.len(), 4, "{gates:#?}");
+        assert_eq!(gates.len(), 5, "{gates:#?}");
         assert!(gates.iter().all(|event| event["state"] == "passed"));
         assert_eq!(gates[0]["role"], "scout");
         assert_eq!(gates[0]["blocked_role"], "implementer");
         assert_eq!(gates[3]["role"], "verifier");
         assert_eq!(gates[3]["blocked_role"], "release_lead");
+        assert_eq!(gates[4]["role"], "release_lead");
+        assert!(gates[4]["blocked_role"].is_null());
 
         let promoted = events
             .iter()
@@ -5823,24 +5988,60 @@ reviewer = "reviewer"
         (client, calls)
     }
 
+    async fn fake_chat_client_responses(
+        response_texts: &[&str],
+    ) -> (DeepSeekClient, Arc<AtomicUsize>) {
+        let (client, calls, _) = fake_chat_client_capturing_responses(response_texts).await;
+        (client, calls)
+    }
+
     async fn fake_chat_client_capturing(
         response_text: &str,
     ) -> (DeepSeekClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        fake_chat_client_capturing_responses(&[response_text]).await
+    }
+
+    async fn fake_chat_client_capturing_responses(
+        response_texts: &[&str],
+    ) -> (DeepSeekClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        assert!(
+            !response_texts.is_empty(),
+            "fake chat client needs at least one response"
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let response_text = response_text.to_string();
+        let response_texts = Arc::new(
+            response_texts
+                .iter()
+                .map(|response| (*response).to_string())
+                .collect::<Vec<_>>(),
+        );
         let app = Router::new().route(
             "/{*path}",
             post({
                 let calls = Arc::clone(&calls);
                 let bodies = Arc::clone(&bodies);
+                let response_texts = Arc::clone(&response_texts);
                 move |Json(body): Json<Value>| {
                     let calls = Arc::clone(&calls);
                     let bodies = Arc::clone(&bodies);
-                    let response_text = response_text.clone();
+                    let response_texts = Arc::clone(&response_texts);
                     async move {
                         bodies.lock().expect("capture body").push(body);
                         let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        let response_text = if response_texts.len() == 1 {
+                            response_texts[0].clone()
+                        } else {
+                            response_texts
+                                .get(attempt - 1)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "fake chat server received call {attempt} but only {} responses were supplied",
+                                        response_texts.len()
+                                    )
+                                })
+                                .clone()
+                        };
                         Json(json!({
                             "id": format!("chatcmpl-workflow-test-{attempt}"),
                             "model": "deepseek-v4-flash",
