@@ -72,6 +72,7 @@ pub enum ApiProvider {
     Deepinfra,
     Sakana,
     LongCat,
+    OpencodeGo,
     Meta,
     Xai,
     /// User-defined OpenAI-compatible endpoint (#1519).
@@ -233,6 +234,7 @@ impl ApiProvider {
             Self::Deepinfra => "https://deepinfra.com/dash/api_keys",
             Self::Sakana => "https://api.sakana.ai/",
             Self::LongCat => "https://longcat.chat/platform",
+            Self::OpencodeGo => "https://opencode.ai/zen/",
             Self::Meta => "https://developer.meta.com/ai/",
             Self::Xai => "https://console.x.ai/",
             Self::OpenaiCodex | Self::Sglang | Self::Vllm | Self::Ollama => return None,
@@ -250,7 +252,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 35] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 36] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -283,13 +285,14 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Deepinfra),
         Some(codewhale_config::ProviderKind::Sakana),
         Some(codewhale_config::ProviderKind::LongCat),
+        Some(codewhale_config::ProviderKind::OpencodeGo),
         Some(codewhale_config::ProviderKind::Meta),
         Some(codewhale_config::ProviderKind::Xai),
         Some(codewhale_config::ProviderKind::Custom),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 34] = [
+    const FROM_KIND_LOOKUP: [Self; 35] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -321,6 +324,7 @@ impl ApiProvider {
         Self::Deepinfra,
         Self::Sakana,
         Self::LongCat,
+        Self::OpencodeGo,
         Self::Meta,
         Self::Xai,
         Self::Custom,
@@ -416,6 +420,9 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
             normalized.as_str(),
             "longcat" | "long_cat" | "meituan_longcat" | "meituan"
         ),
+        ApiProvider::OpencodeGo => {
+            matches!(normalized.as_str(), "opencode_go" | "opencodego")
+        }
         ApiProvider::Meta => matches!(
             normalized.as_str(),
             "meta" | "meta_ai" | "meta_model_api" | "muse" | "muse_spark"
@@ -705,8 +712,10 @@ pub(crate) fn normalize_custom_model_id(model: &str) -> Option<String> {
 
 /// Validate a user-requested model id against the active provider (#3018).
 ///
-/// DeepSeek providers use the strict `normalize_model_name` gate (official
-/// API only accepts DeepSeek IDs).  All other providers pass any non-empty,
+/// DeepSeek providers use the strict `normalize_model_name` gate (the official
+/// API only accepts DeepSeek IDs). OpenCode Go uses its documented Chat
+/// Completions allowlist because the shared Go roster also contains
+/// Messages-only models. Other providers pass any non-empty,
 /// non-control-character string through — the provider API is the authority.
 #[must_use]
 pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
@@ -714,6 +723,7 @@ pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Optio
         ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic => {
             normalize_model_name(model)
         }
+        ApiProvider::OpencodeGo => opencode_go_chat_model_id(model).map(str::to_string),
         _ => normalize_custom_model_id(model),
     }
 }
@@ -737,6 +747,8 @@ pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Optio
 ///    "foreign to a direct provider" classification the model resolver uses,
 ///    so DeepSeek aggregators (NVIDIA NIM, OpenRouter, Fireworks, …) stay
 ///    permissive.
+/// 3. OpenCode Go accepts only models documented for its Chat Completions
+///    endpoint; models served only over Anthropic Messages are rejected.
 ///
 /// Returns `Ok(())` for any tuple we cannot confidently reject (the provider
 /// API remains the final authority for those).
@@ -750,6 +762,18 @@ pub fn validate_route(provider: ApiProvider, model: &str) -> Result<(), String> 
     }
     if trimmed.eq_ignore_ascii_case("auto") {
         return Ok(());
+    }
+
+    if provider == ApiProvider::OpencodeGo {
+        return if opencode_go_chat_model_id(trimmed).is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Model '{trimmed}' is not available through OpenCode Go Chat Completions. \
+                 Choose one of: {}.",
+                OPENCODE_GO_CHAT_MODELS.join(", ")
+            ))
+        };
     }
 
     // Providers whose model id is passed through verbatim (OpenAI-compatible,
@@ -920,6 +944,10 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
+    codewhale_config::opencode_go_chat_model_id(model)
+}
+
 fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
@@ -1051,13 +1079,11 @@ fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
 /// Resolve a user-entered model id to the canonical family id a provider
 /// understands, without any wire-id translation.
 ///
-/// Model families are treated equally: every provider-owned family (GLM via
-/// Z.ai/Zhipu, Kimi, Xiaomi MiMo, MiniMax, Arcee, OpenRouter slugs, …)
-/// resolves through the same "apply the family's canonical map, else pass the
-/// input through" path. Nothing is rejected just because it is not a
-/// DeepSeek id — the upstream API remains the final authority, mirroring how
-/// the models.dev catalog (the route resolver's source of truth) carries one
-/// authoritative id per offering regardless of vendor.
+/// Most provider-owned families (GLM via Z.ai/Zhipu, Kimi, Xiaomi MiMo,
+/// MiniMax, Arcee, OpenRouter slugs, …) resolve through the same "apply the
+/// family's canonical map, else pass the input through" path. OpenCode Go is
+/// deliberately stricter because one provider roster spans two incompatible
+/// wire protocols; only its Chat Completions rows may resolve here.
 ///
 /// This is the canonicalization half of what [`normalize_model_name_for_provider`]
 /// used to fuse together. Wire-id translation (e.g. `deepseek-v4-pro` → an
@@ -1065,13 +1091,22 @@ fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
 /// resolver at request time, not to a name typed into `/provider`, so it is
 /// deliberately kept out of here.
 ///
-/// Returns `None` only for empty or control-character input; every other id
-/// passes through so a custom/self-hosted endpoint is never wrongly rejected.
+/// Returns `None` for empty or control-character input and for ids outside the
+/// OpenCode Go Chat Completions allowlist. Other provider ids pass through so a
+/// custom/self-hosted endpoint is never wrongly rejected.
 #[must_use]
 pub fn canonical_model_id_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
     let trimmed = model.trim();
     if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
         return None;
+    }
+
+    // OpenCode Go is a strict protocol slice: its live `/models` response also
+    // advertises Anthropic-Messages-only models, but this provider sends OpenAI
+    // Chat Completions. Unknown and Messages-only ids must stop here rather
+    // than falling through to the generic pass-through path below.
+    if provider == ApiProvider::OpencodeGo {
+        return opencode_go_chat_model_id(trimmed).map(str::to_string);
     }
 
     // Provider-owned model families resolve through their own canonical map,
@@ -1164,6 +1199,11 @@ pub fn wire_model_for_provider(provider: ApiProvider, model: &str) -> String {
     if trimmed.is_empty() {
         return trimmed.to_string();
     }
+    if provider == ApiProvider::OpencodeGo {
+        return opencode_go_chat_model_id(trimmed)
+            .unwrap_or(DEFAULT_OPENCODE_GO_MODEL)
+            .to_string();
+    }
     if matches!(provider, ApiProvider::XiaomiMimo) {
         return normalize_model_name_for_provider(provider, trimmed)
             .unwrap_or_else(|| trimmed.to_string());
@@ -1184,6 +1224,12 @@ pub fn wire_model_for_provider_route(provider: ApiProvider, base_url: &str, mode
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return trimmed.to_string();
+    }
+    // OpenCode Go's provider identity is the Chat Completions protocol
+    // boundary even when its base URL is overridden. Do not let the generic
+    // custom-endpoint passthrough re-admit a Messages-only model.
+    if provider == ApiProvider::OpencodeGo {
+        return wire_model_for_provider(provider, trimmed);
     }
     if base_url_is_custom_for_provider(provider, base_url) {
         return trimmed.to_string();
@@ -1280,6 +1326,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ],
         ApiProvider::Sakana => vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL],
         ApiProvider::LongCat => vec![DEFAULT_LONGCAT_MODEL],
+        ApiProvider::OpencodeGo => OPENCODE_GO_CHAT_MODELS.to_vec(),
         ApiProvider::Meta => vec![DEFAULT_META_MODEL],
         ApiProvider::Xai => vec![
             DEFAULT_XAI_MODEL,
@@ -2771,6 +2818,8 @@ pub struct ProvidersConfig {
         alias = "meituan"
     )]
     pub longcat: ProviderConfig,
+    #[serde(default, alias = "opencode-go", alias = "opencodego")]
+    pub opencode_go: ProviderConfig,
     #[serde(
         default,
         alias = "meta-ai",
@@ -2834,6 +2883,7 @@ impl ProvidersConfig {
             ("providers.minimax", &self.minimax),
             ("providers.minimax_anthropic", &self.minimax_anthropic),
             ("providers.sakana", &self.sakana),
+            ("providers.opencode_go", &self.opencode_go),
             ("providers.meta", &self.meta),
             ("providers.xai", &self.xai),
         ];
@@ -4034,6 +4084,7 @@ impl Config {
             ApiProvider::MinimaxAnthropic => &providers.minimax_anthropic,
             ApiProvider::Sakana => &providers.sakana,
             ApiProvider::LongCat => &providers.longcat,
+            ApiProvider::OpencodeGo => &providers.opencode_go,
             ApiProvider::Meta => &providers.meta,
             ApiProvider::Xai => &providers.xai,
             // Handled by the name-keyed early return above (#1519).
@@ -4098,6 +4149,7 @@ impl Config {
             ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
             ApiProvider::Sakana => &mut providers.sakana,
             ApiProvider::LongCat => &mut providers.longcat,
+            ApiProvider::OpencodeGo => &mut providers.opencode_go,
             ApiProvider::Meta => &mut providers.meta,
             ApiProvider::Xai => &mut providers.xai,
             // Handled by the name-keyed early return above (#1519).
@@ -4404,6 +4456,7 @@ impl Config {
             ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => DEFAULT_MINIMAX_MODEL,
             ApiProvider::Sakana => DEFAULT_SAKANA_MODEL,
             ApiProvider::LongCat => DEFAULT_LONGCAT_MODEL,
+            ApiProvider::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
             ApiProvider::Meta => DEFAULT_META_MODEL,
             ApiProvider::Xai => DEFAULT_XAI_MODEL,
             // Custom endpoints have no built-in default model; pass through the
@@ -4461,6 +4514,7 @@ impl Config {
             | ApiProvider::MinimaxAnthropic
             | ApiProvider::Sakana
             | ApiProvider::LongCat
+            | ApiProvider::OpencodeGo
             | ApiProvider::Meta
             | ApiProvider::Xai => None,
             ApiProvider::Custom if self.uses_legacy_literal_custom_route() => self.base_url.clone(),
@@ -4525,6 +4579,7 @@ impl Config {
                         ApiProvider::MinimaxAnthropic => DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
                         ApiProvider::Sakana => DEFAULT_SAKANA_BASE_URL,
                         ApiProvider::LongCat => DEFAULT_LONGCAT_BASE_URL,
+                        ApiProvider::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
                         ApiProvider::Meta => DEFAULT_META_BASE_URL,
                         ApiProvider::Xai => DEFAULT_XAI_BASE_URL,
                         // No built-in endpoint; descriptor placeholder keeps the
@@ -5501,6 +5556,7 @@ fn root_deepseek_model_is_foreign_to_direct_provider(provider: ApiProvider, mode
             | ApiProvider::Vllm
             | ApiProvider::Volcengine
             | ApiProvider::Atlascloud
+            | ApiProvider::OpencodeGo
             | ApiProvider::WanjieArk
     ) {
         return false;
@@ -5703,6 +5759,7 @@ fn provider_env_base_url_override(provider: ApiProvider) -> Option<String> {
         ApiProvider::Huggingface => &["HUGGINGFACE_BASE_URL", "HF_BASE_URL"],
         ApiProvider::Meta => &["META_MODEL_API_BASE_URL", "MODEL_API_BASE_URL"],
         ApiProvider::Xai => &["XAI_BASE_URL"],
+        ApiProvider::OpencodeGo => &["OPENCODE_GO_BASE_URL"],
         ApiProvider::Deepseek
         | ApiProvider::DeepseekCN
         | ApiProvider::DeepseekAnthropic
@@ -5960,6 +6017,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .providers
                     .get_or_insert_with(ProvidersConfig::default)
                     .longcat
+                    .base_url = Some(value);
+            }
+            ApiProvider::OpencodeGo => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .opencode_go
                     .base_url = Some(value);
             }
             ApiProvider::Meta => {
@@ -6232,6 +6296,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
                 ApiProvider::Sakana => &mut providers.sakana,
                 ApiProvider::LongCat => &mut providers.longcat,
+                ApiProvider::OpencodeGo => &mut providers.opencode_go,
                 ApiProvider::Meta => &mut providers.meta,
                 ApiProvider::Xai => &mut providers.xai,
                 ApiProvider::Custom => providers
@@ -6408,6 +6473,16 @@ fn apply_env_overrides(config: &mut Config) {
             .xai
             .model = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::OpencodeGo)
+        && let Ok(value) = std::env::var("OPENCODE_GO_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .opencode_go
+            .model = Some(value);
+    }
     if let Some(value) = codewhale_env_var("CODEWHALE_MODEL", "DEEPSEEK_MODEL")
         .ok()
         .or_else(|| {
@@ -6482,6 +6557,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
                 ApiProvider::Sakana => &mut providers.sakana,
                 ApiProvider::LongCat => &mut providers.longcat,
+                ApiProvider::OpencodeGo => &mut providers.opencode_go,
                 ApiProvider::Meta => &mut providers.meta,
                 ApiProvider::Xai => &mut providers.xai,
             };
@@ -7345,6 +7421,7 @@ fn merge_providers(
             ),
             sakana: merge_provider_config(base.sakana, override_cfg.sakana),
             longcat: merge_provider_config(base.longcat, override_cfg.longcat),
+            opencode_go: merge_provider_config(base.opencode_go, override_cfg.opencode_go),
             meta: merge_provider_config(base.meta, override_cfg.meta),
             xai: merge_provider_config(base.xai, override_cfg.xai),
             custom: merge_custom_providers(base.custom, override_cfg.custom),

@@ -275,6 +275,13 @@ pub struct ProvidersToml {
     #[serde(
         default,
         skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "opencode-go",
+        alias = "opencodego"
+    )]
+    pub opencode_go: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "meta-ai",
         alias = "meta_ai",
         alias = "meta-model-api",
@@ -398,6 +405,7 @@ impl ProvidersToml {
             ProviderKind::Deepinfra => &self.deepinfra,
             ProviderKind::Sakana => &self.sakana,
             ProviderKind::LongCat => &self.longcat,
+            ProviderKind::OpencodeGo => &self.opencode_go,
             ProviderKind::Meta => &self.meta,
             ProviderKind::Xai => &self.xai,
             ProviderKind::Custom => &self.custom,
@@ -437,6 +445,7 @@ impl ProvidersToml {
             ProviderKind::Deepinfra => &mut self.deepinfra,
             ProviderKind::Sakana => &mut self.sakana,
             ProviderKind::LongCat => &mut self.longcat,
+            ProviderKind::OpencodeGo => &mut self.opencode_go,
             ProviderKind::Meta => &mut self.meta,
             ProviderKind::Xai => &mut self.xai,
             ProviderKind::Custom => &mut self.custom,
@@ -2291,6 +2300,7 @@ impl ConfigToml {
                 ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL.to_string(),
                 ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL.to_string(),
                 ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL.to_string(),
+                ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL.to_string(),
                 ProviderKind::Meta => DEFAULT_META_BASE_URL.to_string(),
                 ProviderKind::Xai => DEFAULT_XAI_BASE_URL.to_string(),
                 // The custom provider has no built-in endpoint; fall back to its
@@ -2372,12 +2382,17 @@ impl ConfigToml {
                     default_model_for_provider(provider).to_string()
                 }
             });
-        let model =
-            if explicit_model && provider_preserves_custom_base_url_model(provider, &base_url) {
-                model.trim().to_string()
-            } else {
-                normalize_model_for_provider(provider, &model)
-            };
+        let model = if provider == ProviderKind::OpencodeGo {
+            // OpenCode Go's `/models` response also contains models that only
+            // speak Anthropic Messages. This provider is deliberately bound to
+            // Chat Completions, so even custom endpoint/env overrides cannot
+            // promote an incompatible id onto `/chat/completions`.
+            normalize_model_for_provider(provider, &model)
+        } else if explicit_model && provider_preserves_custom_base_url_model(provider, &base_url) {
+            model.trim().to_string()
+        } else {
+            normalize_model_for_provider(provider, &model)
+        };
 
         let mut http_headers = self.http_headers.clone();
         http_headers.extend(provider_cfg.http_headers.clone());
@@ -2533,6 +2548,11 @@ fn project_config_candidate_exists(path: &Path) -> bool {
 }
 
 fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
+    if matches!(provider, ProviderKind::OpencodeGo) {
+        return opencode_go_chat_model_id(model)
+            .unwrap_or(DEFAULT_OPENCODE_GO_MODEL)
+            .to_string();
+    }
     if matches!(provider, ProviderKind::XiaomiMimo)
         && let Some(canonical) = canonical_xiaomi_mimo_model_id(model)
     {
@@ -2676,6 +2696,29 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         _ => model.to_string(),
+    }
+}
+
+/// Canonicalize an OpenCode Go model that is documented for the OpenAI Chat
+/// Completions endpoint. The live `/models` roster also contains
+/// Anthropic-Messages-only models; returning `None` for those is the protocol
+/// cutline shared by config and the TUI live-catalog paths.
+#[must_use]
+pub fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    let normalized = normalized
+        .strip_prefix("opencode-go/")
+        .unwrap_or(&normalized);
+    match normalized {
+        "glm-5.2" | "glm-5-2" => Some(OPENCODE_GO_GLM_5_2_MODEL),
+        "glm-5.1" | "glm-5-1" => Some(OPENCODE_GO_GLM_5_1_MODEL),
+        "kimi-k2.7-code" | "kimi-k2-7-code" => Some(OPENCODE_GO_KIMI_K2_7_CODE_MODEL),
+        "kimi-k2.6" | "kimi-k2-6" => Some(OPENCODE_GO_KIMI_K2_6_MODEL),
+        "deepseek-v4-pro" | "deepseek-v4pro" => Some(DEFAULT_OPENCODE_GO_MODEL),
+        "deepseek-v4-flash" | "deepseek-v4flash" => Some(OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL),
+        "mimo-v2.5" | "mimo-v2-5" => Some(OPENCODE_GO_MIMO_V2_5_MODEL),
+        "mimo-v2.5-pro" | "mimo-v2-5-pro" => Some(OPENCODE_GO_MIMO_V2_5_PRO_MODEL),
+        _ => None,
     }
 }
 
@@ -2893,6 +2936,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
         ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
         ProviderKind::LongCat => DEFAULT_LONGCAT_MODEL,
+        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
         ProviderKind::Meta => DEFAULT_META_MODEL,
         ProviderKind::Xai => DEFAULT_XAI_MODEL,
         // No built-in default model; the registry placeholder keeps this total.
@@ -2933,6 +2977,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
         ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
         ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL,
+        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
         ProviderKind::Meta => DEFAULT_META_BASE_URL,
         ProviderKind::Xai => DEFAULT_XAI_BASE_URL,
         // No built-in default base URL; the registry placeholder keeps this total.
@@ -4568,6 +4613,8 @@ struct EnvRuntimeOverrides {
     sakana_model: Option<String>,
     longcat_base_url: Option<String>,
     longcat_model: Option<String>,
+    opencode_go_base_url: Option<String>,
+    opencode_go_model: Option<String>,
     meta_base_url: Option<String>,
     meta_model: Option<String>,
     xai_base_url: Option<String>,
@@ -4819,6 +4866,12 @@ impl EnvRuntimeOverrides {
             longcat_model: std::env::var("LONGCAT_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            opencode_go_base_url: std::env::var("OPENCODE_GO_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            opencode_go_model: std::env::var("OPENCODE_GO_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             meta_base_url: std::env::var("META_MODEL_API_BASE_URL")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
@@ -4894,6 +4947,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepinfra => self.deepinfra_base_url.clone(),
             ProviderKind::Sakana => self.sakana_base_url.clone(),
             ProviderKind::LongCat => self.longcat_base_url.clone(),
+            ProviderKind::OpencodeGo => self.opencode_go_base_url.clone(),
             ProviderKind::Meta => self.meta_base_url.clone(),
             ProviderKind::Xai => self.xai_base_url.clone(),
             // No dedicated CODEWHALE_CUSTOM_BASE_URL env override: a custom
@@ -4927,6 +4981,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepinfra => self.deepinfra_model.clone(),
             ProviderKind::Sakana => self.sakana_model.clone(),
             ProviderKind::LongCat => self.longcat_model.clone(),
+            ProviderKind::OpencodeGo => self.opencode_go_model.clone(),
             ProviderKind::Meta => self.meta_model.clone(),
             ProviderKind::Xai => self.xai_model.clone(),
             _ => None,

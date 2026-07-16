@@ -168,6 +168,13 @@ fn inferred_provider_for_model(
     configured_provider: ProviderKind,
     model_name: &str,
 ) -> Option<ProviderKind> {
+    // OpenCode Go is an explicit Chat-only provider scope. A same-named model
+    // on OpenRouter/MiniMax must not escape that scope through the registry's
+    // global inference; RouteResolver owns the authoritative Go allowlist and
+    // will reject Messages-only ids.
+    if configured_provider == ProviderKind::OpencodeGo {
+        return Some(configured_provider);
+    }
     let scoped = registry.resolve(Some(model_name), Some(configured_provider));
     if !scoped.used_fallback && scoped.resolved.provider == configured_provider {
         return Some(configured_provider);
@@ -837,6 +844,63 @@ api_key = {provider_api_key:?}
                 .expect("configured-provider route");
 
         assert_eq!(endpoint.provider, ProviderKind::Openrouter);
+    }
+
+    #[test]
+    fn opencode_go_app_route_cannot_cross_route_or_bypass_chat_allowlist() {
+        let registry = ModelRegistry::default();
+        let messages_models = [
+            "minimax-m3",
+            "minimax-m2.7",
+            "minimax-m2.5",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.6-plus",
+        ];
+
+        for model in messages_models {
+            for requested in [model.to_string(), format!("opencode-go/{model}")] {
+                let mut config = ConfigToml {
+                    provider: ProviderKind::OpencodeGo,
+                    ..ConfigToml::default()
+                };
+                config.providers.opencode_go.model = Some(requested.clone());
+                assert!(
+                    matches!(
+                        resolve_endpoint(&config, &registry, None),
+                        Err(RouteError::ForeignModelForDirectProvider { .. })
+                    ),
+                    "static {requested} must be rejected"
+                );
+                assert!(
+                    matches!(
+                        resolve_endpoint(&config, &registry, Some(&requested)),
+                        Err(RouteError::ForeignModelForDirectProvider { .. })
+                    ),
+                    "request {requested} must not cross-route"
+                );
+
+                config.providers.opencode_go.base_url =
+                    Some("https://go-gateway.example.test/v1".to_string());
+                assert!(
+                    matches!(
+                        resolve_endpoint(&config, &registry, Some(&requested)),
+                        Err(RouteError::ForeignModelForDirectProvider { .. })
+                    ),
+                    "custom-base {requested} must still be rejected"
+                );
+            }
+        }
+
+        let mut valid = ConfigToml {
+            provider: ProviderKind::OpencodeGo,
+            ..ConfigToml::default()
+        };
+        valid.providers.opencode_go.model = Some("opencode-go/glm-5.2".to_string());
+        let endpoint = resolve_endpoint(&valid, &registry, None).expect("valid Go route");
+        assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
+        assert_eq!(endpoint.model, "glm-5.2");
+        assert_eq!(endpoint.wire_format, WireFormat::ChatCompletions);
     }
 
     #[test]

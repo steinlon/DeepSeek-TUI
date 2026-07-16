@@ -869,6 +869,9 @@ struct EnvGuard {
     xai_api_key: Option<OsString>,
     xai_base_url: Option<OsString>,
     xai_model: Option<OsString>,
+    opencode_go_api_key: Option<OsString>,
+    opencode_go_base_url: Option<OsString>,
+    opencode_go_model: Option<OsString>,
     meta_model_api_key: Option<OsString>,
     model_api_key: Option<OsString>,
     meta_model_api_base_url: Option<OsString>,
@@ -895,6 +898,9 @@ impl EnvGuard {
             xai_api_key: env::var_os("XAI_API_KEY"),
             xai_base_url: env::var_os("XAI_BASE_URL"),
             xai_model: env::var_os("XAI_MODEL"),
+            opencode_go_api_key: env::var_os("OPENCODE_GO_API_KEY"),
+            opencode_go_base_url: env::var_os("OPENCODE_GO_BASE_URL"),
+            opencode_go_model: env::var_os("OPENCODE_GO_MODEL"),
             meta_model_api_key: env::var_os("META_MODEL_API_KEY"),
             model_api_key: env::var_os("MODEL_API_KEY"),
             meta_model_api_base_url: env::var_os("META_MODEL_API_BASE_URL"),
@@ -1014,6 +1020,9 @@ impl EnvGuard {
             env::remove_var("XAI_API_KEY");
             env::remove_var("XAI_BASE_URL");
             env::remove_var("XAI_MODEL");
+            env::remove_var("OPENCODE_GO_API_KEY");
+            env::remove_var("OPENCODE_GO_BASE_URL");
+            env::remove_var("OPENCODE_GO_MODEL");
             env::remove_var("META_MODEL_API_KEY");
             env::remove_var("MODEL_API_KEY");
             env::remove_var("META_MODEL_API_BASE_URL");
@@ -1156,6 +1165,9 @@ impl Drop for EnvGuard {
             Self::restore_var("XAI_API_KEY", self.xai_api_key.take());
             Self::restore_var("XAI_BASE_URL", self.xai_base_url.take());
             Self::restore_var("XAI_MODEL", self.xai_model.take());
+            Self::restore_var("OPENCODE_GO_API_KEY", self.opencode_go_api_key.take());
+            Self::restore_var("OPENCODE_GO_BASE_URL", self.opencode_go_base_url.take());
+            Self::restore_var("OPENCODE_GO_MODEL", self.opencode_go_model.take());
             Self::restore_var("META_MODEL_API_KEY", self.meta_model_api_key.take());
             Self::restore_var("MODEL_API_KEY", self.model_api_key.take());
             Self::restore_var(
@@ -3731,6 +3743,77 @@ fn xai_api_key_provider_resolves_defaults_and_scopes_env_credentials() {
     assert_eq!(resolved.api_key_source, None);
     assert_eq!(resolved.base_url, "https://xai-gateway.example/v1");
     assert_eq!(resolved.model, "grok-4.3");
+}
+
+#[test]
+fn opencode_go_resolves_current_chat_completions_route() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    for alias in ["opencode-go", "opencode_go", "opencodego"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::OpencodeGo));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("OpenCode Go alias");
+        assert_eq!(parsed.provider, ProviderKind::OpencodeGo);
+    }
+
+    let metadata = provider::resolve_provider("opencode_go").expect("provider metadata");
+    assert_eq!(metadata.id(), "opencode-go");
+    assert_eq!(metadata.display_name(), "OpenCode Go");
+    assert_eq!(metadata.provider_config_key(), "opencode_go");
+    assert_eq!(metadata.default_base_url(), DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(metadata.default_model(), DEFAULT_OPENCODE_GO_MODEL);
+    assert_eq!(metadata.env_vars(), &["OPENCODE_GO_API_KEY"]);
+    assert_eq!(metadata.wire(), provider::WireFormat::ChatCompletions);
+
+    let config: ConfigToml = toml::from_str(
+        r#"
+provider = "opencode-go"
+
+[providers.opencode_go]
+api_key = "go-config-key"
+model = "opencode-go/glm-5.2"
+"#,
+    )
+    .expect("OpenCode Go provider table");
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.provider, ProviderKind::OpencodeGo);
+    assert_eq!(resolved.base_url, DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(resolved.model, OPENCODE_GO_GLM_5_2_MODEL);
+    assert_eq!(resolved.api_key.as_deref(), Some("go-config-key"));
+    assert_eq!(
+        resolved.api_key_source,
+        Some(RuntimeApiKeySource::ConfigFile)
+    );
+
+    // Provider-specific environment overrides remain available, but model ids
+    // stay inside the Chat Completions allowlist.
+    unsafe {
+        std::env::set_var("OPENCODE_GO_API_KEY", "go-env-key");
+        std::env::set_var("OPENCODE_GO_MODEL", "opencode-go/mimo-v2.5-pro");
+    }
+    assert_eq!(
+        codewhale_secrets::env_for("opencode-go").as_deref(),
+        Some("go-env-key")
+    );
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(resolved.model, OPENCODE_GO_MIMO_V2_5_PRO_MODEL);
+
+    // The Go roster also includes Messages-only models. Even a custom base URL
+    // cannot make one safe for this Chat Completions provider; resolution falls
+    // back to the provider default instead of sending an incompatible request.
+    unsafe {
+        std::env::set_var("OPENCODE_GO_BASE_URL", "https://go-gateway.example/v1");
+        std::env::set_var("OPENCODE_GO_MODEL", "minimax-m3");
+    }
+    assert!(opencode_go_chat_model_id("minimax-m3").is_none());
+    assert!(opencode_go_chat_model_id("qwen3.7-max").is_none());
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://go-gateway.example/v1");
+    assert_eq!(resolved.model, DEFAULT_OPENCODE_GO_MODEL);
+    assert_eq!(resolved.api_key, None);
 }
 
 #[test]

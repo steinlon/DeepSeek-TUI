@@ -135,6 +135,18 @@ pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 // Meituan LongCat defaults
 pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
+// OpenCode Go Chat Completions defaults. The Go catalog also contains models
+// served only through Anthropic Messages; those are deliberately not listed by
+// this provider until Codewhale can route wire formats per model.
+pub(crate) const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
+pub(crate) const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+pub(crate) const OPENCODE_GO_GLM_5_2_MODEL: &str = "glm-5.2";
+pub(crate) const OPENCODE_GO_GLM_5_1_MODEL: &str = "glm-5.1";
+pub(crate) const OPENCODE_GO_KIMI_K2_7_CODE_MODEL: &str = "kimi-k2.7-code";
+pub(crate) const OPENCODE_GO_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
+pub(crate) const OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-v4-flash";
+pub(crate) const OPENCODE_GO_MIMO_V2_5_MODEL: &str = "mimo-v2.5";
+pub(crate) const OPENCODE_GO_MIMO_V2_5_PRO_MODEL: &str = "mimo-v2.5-pro";
 // Meta Model API / Muse Spark defaults
 pub(crate) const DEFAULT_META_MODEL: &str = "muse-spark-1.1";
 pub(crate) const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";

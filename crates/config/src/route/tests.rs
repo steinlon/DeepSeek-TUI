@@ -672,6 +672,70 @@ fn openrouter_custom_endpoint_preserves_qwen37_alias() {
 }
 
 #[test]
+fn opencode_go_resolver_accepts_only_chat_completions_models() {
+    let resolver = RouteResolver::new();
+    let chat_models = [
+        "glm-5.2",
+        "glm-5.1",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "mimo-v2.5",
+        "mimo-v2.5-pro",
+    ];
+
+    for model in chat_models {
+        for requested in [model.to_string(), format!("opencode-go/{model}")] {
+            let route = resolver
+                .resolve(&req(Some(ProviderKind::OpencodeGo), Some(&requested)))
+                .unwrap_or_else(|error| panic!("{requested} should resolve: {error}"));
+            assert_eq!(route.provider_kind, ProviderKind::OpencodeGo, "{requested}");
+            assert_eq!(route.wire_model_id.as_str(), model, "{requested}");
+        }
+    }
+
+    let automatic = resolver
+        .resolve(&req(Some(ProviderKind::OpencodeGo), Some("auto")))
+        .expect("OpenCode Go auto should resolve to its Chat default");
+    assert_eq!(automatic.wire_model_id.as_str(), "deepseek-v4-pro");
+}
+
+#[test]
+fn opencode_go_resolver_rejects_messages_models_even_on_custom_base_urls() {
+    let resolver = RouteResolver::new();
+    let messages_models = [
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+    ];
+
+    for model in messages_models {
+        for requested in [model.to_string(), format!("opencode-go/{model}")] {
+            for base_url_override in [None, Some("https://go-gateway.example.test/v1".to_string())]
+            {
+                let request = RouteRequest {
+                    explicit_provider: Some(ProviderKind::OpencodeGo),
+                    model_selector: Some(LogicalModelRef::from(requested.as_str())),
+                    saved_provider_model: None,
+                    base_url_override,
+                };
+                assert!(
+                    matches!(
+                        resolver.resolve(&request),
+                        Err(RouteError::ForeignModelForDirectProvider { .. })
+                    ),
+                    "{requested} must not reach OpenCode Go Chat Completions"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn resolver_deepseek_none_selector_uses_default_wire_id() {
     let r = RouteResolver::new();
     let out = r

@@ -76,6 +76,9 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
     if provider == ApiProvider::OpenaiCodex {
         return BillingPresentation::Subscription("Codex OAuth quota");
     }
+    if provider == ApiProvider::OpencodeGo {
+        return BillingPresentation::Subscription("OpenCode Go quota");
+    }
 
     let provider_config = config.provider_config_for(provider);
     match provider {
@@ -146,6 +149,7 @@ pub fn for_child_route(
     }
     match child_provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => BillingPresentation::Local,
+        ApiProvider::OpencodeGo => BillingPresentation::Subscription("OpenCode Go quota"),
         ApiProvider::OpenaiCodex
         | ApiProvider::Xai
         | ApiProvider::Moonshot
@@ -388,6 +392,32 @@ mod tests {
             Some("usage: Codex OAuth quota")
         );
         assert!(!format_usage_line(&chip).contains('$'));
+    }
+
+    #[test]
+    fn opencode_go_quota_never_claims_token_dollars() {
+        let billing = for_route(&Config::default(), ApiProvider::OpencodeGo);
+        assert_eq!(
+            billing,
+            BillingPresentation::Subscription("OpenCode Go quota")
+        );
+        let chip = usage_chip(
+            billing,
+            ApiProvider::OpencodeGo,
+            "deepseek-v4-pro",
+            12.34,
+            CostCurrency::Usd,
+            None,
+        );
+        assert!(!format_usage_line(&chip).contains('$'));
+        assert_eq!(
+            for_child_route(
+                ApiProvider::Deepseek,
+                BillingPresentation::Metered,
+                ApiProvider::OpencodeGo,
+            ),
+            BillingPresentation::Subscription("OpenCode Go quota")
+        );
     }
 
     #[test]

@@ -28,6 +28,20 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>v0.9.1 — provider and runtime hardening</strong></summary>
+
+- **[zhangweiii](https://github.com/zhangweiii)** and
+  **[Sterne Lee / sternelee](https://github.com/sternelee)** — the original
+  first-class OpenCode Go implementations in PRs #773 and #1050, harvested
+  into the current provider architecture with co-authorship planned for the
+  landing commit
+- **[Sean Tse / seanthefuturegorilla](https://github.com/seanthefuturegorilla)**
+  — the canonical OpenCode Go/Zen provider request and acceptance direction in
+  #1481
+
+</details>
+
+<details open>
 <summary><strong>v0.9.0 — underwater shell, runtime persistence &amp; release evidence</strong></summary>
 
 The v0.9.0 lane grew from a maintenance sweep into the underwater shell,

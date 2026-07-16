@@ -13139,6 +13139,7 @@ fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, ap
         ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
         ApiProvider::Sakana => &mut providers.sakana,
         ApiProvider::LongCat => &mut providers.longcat,
+        ApiProvider::OpencodeGo => &mut providers.opencode_go,
         ApiProvider::Meta => &mut providers.meta,
         ApiProvider::Xai => &mut providers.xai,
     };
@@ -13265,6 +13266,7 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
         ApiProvider::Sakana => &mut providers.sakana,
         ApiProvider::LongCat => &mut providers.longcat,
+        ApiProvider::OpencodeGo => &mut providers.opencode_go,
         ApiProvider::Meta => &mut providers.meta,
         ApiProvider::Xai => &mut providers.xai,
     };

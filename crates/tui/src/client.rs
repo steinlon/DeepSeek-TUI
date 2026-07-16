@@ -23,7 +23,9 @@ use codewhale_config::catalog::{
 use codewhale_config::route::ReadyRouteCandidate;
 use codewhale_config::{auth_mode_disables_api_key, is_upstream_auth_header};
 
-use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider_route};
+use crate::config::{
+    ApiProvider, Config, RetryPolicy, validate_route, wire_model_for_provider_route,
+};
 use crate::llm_client::{
     LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after,
     sanitize_http_error_body, with_retry,
@@ -887,10 +889,13 @@ impl DeepSeekClient {
     /// the two entry points; everything else (auth, provider, retry, headers,
     /// timeouts) is derived from `config` so the two paths cannot drift.
     fn from_parts(base_url: String, default_model: String, config: &Config) -> Result<Self> {
+        let api_provider = config.api_provider();
+        if api_provider == ApiProvider::OpencodeGo {
+            validate_route(api_provider, &default_model).map_err(anyhow::Error::msg)?;
+        }
         let api_key = config.deepseek_api_key()?;
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
-        let api_provider = config.api_provider();
         validate_base_url_security(&base_url)?;
         let retry = config.retry_policy();
         let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
@@ -1433,6 +1438,7 @@ impl DeepSeekClient {
             .context("Failed to read models response body")?;
 
         parse_models_response(&response_text)
+            .map(|models| apply_provider_model_cutline(self.api_provider, models))
     }
 
     /// The catalog provider id for this client (the `ProviderKind` slug, falling
@@ -1508,8 +1514,10 @@ impl DeepSeekClient {
                 })
                 .collect()
         } else {
-            let models =
-                parse_models_response(&body).map_err(|_| CatalogRefreshError::InvalidResponse)?;
+            let models = apply_provider_model_cutline(
+                self.api_provider,
+                parse_models_response(&body).map_err(|_| CatalogRefreshError::InvalidResponse)?,
+            );
             if models.is_empty() {
                 return Err(CatalogRefreshError::EmptyList);
             }
@@ -2011,6 +2019,32 @@ pub(super) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>
     Ok(models)
 }
 
+/// Apply provider-owned protocol cutlines to a live `/models` response.
+///
+/// OpenCode Go mixes OpenAI Chat Completions and Anthropic Messages models in
+/// one roster. Codewhale's `OpencodeGo` route is intentionally Chat-only, so
+/// both `/models` consumers must share this filter before publishing choices.
+fn apply_provider_model_cutline(
+    provider: ApiProvider,
+    models: Vec<AvailableModel>,
+) -> Vec<AvailableModel> {
+    if provider != ApiProvider::OpencodeGo {
+        return models;
+    }
+
+    let mut models: Vec<_> = models
+        .into_iter()
+        .filter_map(|mut model| {
+            let canonical = crate::config::opencode_go_chat_model_id(&model.id)?;
+            model.id = canonical.to_string();
+            Some(model)
+        })
+        .collect();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    models
+}
+
 /// Parse an OpenRouter `/models` response, preserving server-side ordering and
 /// capturing full capability metadata (#3385).
 fn parse_openrouter_models_response(
@@ -2245,6 +2279,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::OpencodeGo => {}
             ApiProvider::Meta => {}
             ApiProvider::Xai => {}
         },
@@ -2339,6 +2374,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::OpencodeGo => {}
             ApiProvider::Meta => {}
             ApiProvider::Xai => {}
         },
@@ -2413,6 +2449,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::OpencodeGo => {}
             ApiProvider::Meta => {}
             ApiProvider::Xai => {}
         },
@@ -5375,6 +5412,23 @@ mod tests {
         .expect("openrouter client")
     }
 
+    fn opencode_go_client_for(server: &MockServer) -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        DeepSeekClient::new(&Config {
+            provider: Some("opencode-go".to_string()),
+            providers: Some(ProvidersConfig {
+                opencode_go: ProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    base_url: Some(server.uri()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("OpenCode Go client")
+    }
+
     async fn mount_models_json(server: &MockServer, status: u16, body: serde_json::Value) {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -5413,6 +5467,79 @@ mod tests {
 
         assert!(err.contains("HTTP 401"), "status is preserved: {err}");
         assert!(err.contains("密钥无效"), "unicode body is preserved: {err}");
+    }
+
+    #[test]
+    fn opencode_go_client_rejects_messages_only_config_models() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for model in [
+            "minimax-m3",
+            "minimax-m2.7",
+            "minimax-m2.5",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.6-plus",
+        ] {
+            let config = Config {
+                provider: Some("opencode-go".to_string()),
+                providers: Some(ProvidersConfig {
+                    opencode_go: ProviderConfig {
+                        api_key: Some("test-key".to_string()),
+                        model: Some(model.to_string()),
+                        ..ProviderConfig::default()
+                    },
+                    ..ProvidersConfig::default()
+                }),
+                ..Config::default()
+            };
+            let err = DeepSeekClient::new(&config)
+                .err()
+                .expect("Messages-only model must fail before client construction");
+            assert!(err.to_string().contains("Chat Completions"), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_go_live_model_paths_keep_only_chat_completions_rows() {
+        let server = MockServer::start().await;
+        let mut rows: Vec<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .map(|id| json!({"id": id}))
+            .collect();
+        rows.extend([
+            json!({"id": "minimax-m3"}),
+            json!({"id": "minimax-m2.7"}),
+            json!({"id": "minimax-m2.5"}),
+            json!({"id": "qwen3.7-max"}),
+            json!({"id": "qwen3.7-plus"}),
+            json!({"id": "qwen3.6-plus"}),
+        ]);
+        mount_models_json(&server, 200, json!({"data": rows})).await;
+        let client = opencode_go_client_for(&server);
+
+        let listed = client.list_models().await.expect("filtered model list");
+        let listed: std::collections::BTreeSet<_> =
+            listed.into_iter().map(|model| model.id).collect();
+        let expected: std::collections::BTreeSet<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect();
+        assert_eq!(listed, expected);
+
+        let delta = client.fetch_catalog_delta().await.expect("filtered delta");
+        assert_eq!(delta.provider, "opencode-go");
+        let delta_ids: std::collections::BTreeSet<_> = delta
+            .offerings
+            .iter()
+            .map(|offering| offering.wire_model_id.clone())
+            .collect();
+        assert_eq!(delta_ids, expected);
+        assert!(
+            delta
+                .offerings
+                .iter()
+                .all(|offering| offering.endpoint_key == "chat")
+        );
     }
 
     #[tokio::test]

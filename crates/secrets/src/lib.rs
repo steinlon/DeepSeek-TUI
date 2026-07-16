@@ -879,6 +879,7 @@ pub fn env_for(name: &str) -> Option<String> {
         ],
         "sakana" | "sakana-ai" | "sakana_ai" | "fugu" => &["FUGU_API_KEY", "SAKANA_API_KEY"],
         "longcat" | "long-cat" | "meituan-longcat" | "meituan" => &["LONGCAT_API_KEY"],
+        "opencode-go" | "opencode_go" | "opencodego" => &["OPENCODE_GO_API_KEY"],
         "meta" | "meta-ai" | "meta_ai" | "meta-model-api" | "meta_model_api" | "muse"
         | "muse-spark" => &["META_MODEL_API_KEY", "MODEL_API_KEY"],
         "xai" | "x-ai" | "x_ai" | "grok" => &["XAI_API_KEY"],
@@ -936,6 +937,7 @@ mod tests {
             "FUGU_API_KEY",
             "SAKANA_API_KEY",
             "LONGCAT_API_KEY",
+            "OPENCODE_GO_API_KEY",
             "META_MODEL_API_KEY",
             "MODEL_API_KEY",
             "XAI_API_KEY",
@@ -1292,6 +1294,19 @@ mod tests {
         assert_eq!(env_for("x-ai").as_deref(), Some("xai-key"));
         assert_eq!(env_for("x_ai").as_deref(), Some("xai-key"));
         assert_eq!(env_for("grok").as_deref(), Some("xai-key"));
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn opencode_go_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("OPENCODE_GO_API_KEY", "go-key") };
+
+        for alias in ["opencode-go", "opencode_go", "opencodego"] {
+            assert_eq!(env_for(alias).as_deref(), Some("go-key"), "{alias}");
+        }
 
         clear_known_envs();
     }

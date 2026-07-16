@@ -17,11 +17,11 @@
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
 # `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`,
-# `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
+# `/provider opencode-go`, `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | meta | xai
+provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | meta | xai
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -565,6 +565,18 @@ max_subagents = 10 # optional (1-20)
 # api_key = "YOUR_LONGCAT_API_KEY"
 # base_url = "https://api.longcat.chat/openai/v1"
 # model = "LongCat-2.0"
+
+# OpenCode Go (https://opencode.ai/docs/go/)
+# Subscription-backed OpenAI-compatible Chat Completions route.
+# Env vars: OPENCODE_GO_API_KEY, OPENCODE_GO_BASE_URL, OPENCODE_GO_MODEL
+# Chat Completions models: glm-5.2, glm-5.1, kimi-k2.7-code, kimi-k2.6,
+# deepseek-v4-pro, deepseek-v4-flash, mimo-v2.5, mimo-v2.5-pro.
+# Models documented only on OpenCode Go's Anthropic `/messages` endpoint are
+# intentionally not advertised by this provider yet.
+[providers.opencode_go]
+# api_key = "YOUR_OPENCODE_GO_API_KEY"
+# base_url = "https://opencode.ai/zen/go/v1"
+# model = "deepseek-v4-pro"
 
 # Meta Model API / Muse Spark (https://developer.meta.com/ai/)
 # OpenAI-compatible Chat Completions route.

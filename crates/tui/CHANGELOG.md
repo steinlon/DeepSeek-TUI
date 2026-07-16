@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add OpenCode Go as a first-class, subscription-backed Chat Completions
+  provider with `[providers.opencode_go]`, `OPENCODE_GO_API_KEY`, and the eight
+  models currently documented on its `/v1/chat/completions` endpoint. Models
+  served only through OpenCode Go's Anthropic `/messages` endpoint remain out
+  of this narrow route until Codewhale supports per-model wire selection
+  (#1481 by @seanthefuturegorilla; implementation harvested from PR #773 by
+  @zhangweiii and PR #1050 by @sternelee).
+
 ## [0.9.0] - 2026-07-16
 
 Codewhale v0.9.0 replaces the default terminal shell with the underwater

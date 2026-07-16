@@ -35,7 +35,7 @@ use super::errors::RouteError;
 use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::{ProviderModelOffering, RouteLimits, bundled_offerings};
 use crate::catalog::{CatalogOffering, bundled_catalog_offerings};
-use crate::{ProviderKind, provider_preserves_custom_base_url_model};
+use crate::{ProviderKind, opencode_go_chat_model_id, provider_preserves_custom_base_url_model};
 
 /// A request to resolve into an executable route.
 ///
@@ -227,7 +227,21 @@ impl RouteResolver {
         ),
         RouteError,
     > {
-        let raw = provider_scoped_wire_alias(provider_kind, logical_model.raw(), class);
+        // OpenCode Go publishes one combined model roster across two wire
+        // protocols. Codewhale's provider is deliberately Chat Completions
+        // only, so this allowlist must sit at the sole route-candidate seam.
+        // In particular, a custom base URL must not reopen generic
+        // LocalOrCustom pass-through for Messages-only model ids.
+        let raw = if provider_kind == ProviderKind::OpencodeGo {
+            opencode_go_chat_model_id(logical_model.raw()).ok_or_else(|| {
+                RouteError::ForeignModelForDirectProvider {
+                    provider: provider_id.clone(),
+                    model: logical_model.raw().to_string(),
+                }
+            })?
+        } else {
+            provider_scoped_wire_alias(provider_kind, logical_model.raw(), class)
+        };
 
         // Try to match a catalog offering owned by THIS provider, either by
         // canonical model id or by exact wire id. This keeps interpretation

@@ -73,6 +73,8 @@ enum ProviderArg {
     Sakana,
     #[value(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
     LongCat,
+    #[value(alias = "opencode_go", alias = "opencodego")]
+    OpencodeGo,
     #[value(
         alias = "meta-ai",
         alias = "meta_ai",
@@ -117,6 +119,7 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Deepinfra => ProviderKind::Deepinfra,
             ProviderArg::Sakana => ProviderKind::Sakana,
             ProviderArg::LongCat => ProviderKind::LongCat,
+            ProviderArg::OpencodeGo => ProviderKind::OpencodeGo,
             ProviderArg::Meta => ProviderKind::Meta,
             ProviderArg::Xai => ProviderKind::Xai,
         }
@@ -4033,6 +4036,13 @@ mod tests {
                 None,
                 "{argv:?} should defer the raw provider id to the TUI"
             );
+        }
+    }
+
+    #[test]
+    fn opencode_go_provider_aliases_parse_as_builtin() {
+        for alias in ["opencode-go", "opencode_go", "opencodego"] {
+            assert_eq!(builtin_provider_arg(alias), Some(ProviderArg::OpencodeGo));
         }
     }
 

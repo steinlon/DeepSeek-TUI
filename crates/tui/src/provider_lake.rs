@@ -17,7 +17,8 @@ use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot, bundled_catalo
 
 use crate::codex_model_cache;
 use crate::config::{
-    ApiProvider, Config, model_completion_names_for_provider, provider_is_configured_for_active,
+    ApiProvider, Config, model_completion_names_for_provider, opencode_go_chat_model_id,
+    provider_is_configured_for_active,
 };
 
 static BUNDLED_SNAPSHOT: std::sync::OnceLock<CatalogSnapshot> = std::sync::OnceLock::new();
@@ -32,12 +33,35 @@ fn bundled_snapshot() -> &'static CatalogSnapshot {
     })
 }
 
+/// Remove catalog rows that cannot use the selected provider's wire protocol.
+///
+/// OpenCode Go publishes one `/models` roster for both Chat Completions and
+/// Anthropic Messages. The `OpencodeGo` route is Chat-only, so sanitize both
+/// saved/live snapshots and the bundled fallback at the lake boundary. This is
+/// deliberately downstream of every publisher so stale cached rows cannot
+/// bypass the client-side live-fetch filter.
+fn apply_provider_model_cutlines(mut snapshot: CatalogSnapshot) -> CatalogSnapshot {
+    snapshot.offerings = snapshot
+        .offerings
+        .into_iter()
+        .filter_map(|mut offering| {
+            if ApiProvider::parse(&offering.provider) == Some(ApiProvider::OpencodeGo) {
+                let canonical = opencode_go_chat_model_id(&offering.wire_model_id)?;
+                offering.provider = ApiProvider::OpencodeGo.as_str().to_string();
+                offering.wire_model_id = canonical.to_string();
+            }
+            Some(offering)
+        })
+        .collect();
+    snapshot
+}
+
 /// Set the live-catalog snapshot. Call this after a background refresh
 /// succeeds; the lake merges live rows over bundled rows on the next read.
 /// Stale or empty snapshots are harmless — a `None` just means "bundled only."
 pub fn set_live_snapshot(snapshot: CatalogSnapshot) {
     if let Ok(mut guard) = LIVE_SNAPSHOT.write() {
-        *guard = Some(snapshot);
+        *guard = Some(apply_provider_model_cutlines(snapshot));
     }
 }
 
@@ -53,7 +77,7 @@ pub fn clear_live_snapshot() {
 /// present, this is just the offline bundled snapshot.
 fn merged_snapshot() -> CatalogSnapshot {
     let live = LIVE_SNAPSHOT.read().ok().and_then(|guard| guard.clone());
-    match live {
+    let merged = match live {
         None => bundled_snapshot().clone(),
         Some(live) => {
             use std::collections::BTreeMap;
@@ -74,7 +98,8 @@ fn merged_snapshot() -> CatalogSnapshot {
                 offerings: merged.into_values().collect(),
             }
         }
-    }
+    };
+    apply_provider_model_cutlines(merged)
 }
 
 /// Maps an [`ApiProvider`] to its bundled-catalog provider id.
@@ -412,6 +437,58 @@ mod tests {
         clear_live_snapshot();
         let after_clear = all_catalog_models_for_provider(ApiProvider::Deepseek);
         assert_eq!(after_clear, bundled);
+    }
+
+    #[test]
+    fn opencode_go_lake_drops_messages_only_saved_and_live_rows() {
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+
+        let mut offerings: Vec<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .map(|model| CatalogOffering {
+                provider: "opencode_go".to_string(),
+                wire_model_id: if *model == crate::config::DEFAULT_OPENCODE_GO_MODEL {
+                    format!("opencode-go/{model}")
+                } else {
+                    (*model).to_string()
+                },
+                endpoint_key: "chat".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        offerings.extend(["minimax-m3", "qwen3.7-max"].map(|model| CatalogOffering {
+            provider: "opencode-go".to_string(),
+            wire_model_id: model.to_string(),
+            endpoint_key: "messages".to_string(),
+            ..Default::default()
+        }));
+        set_live_snapshot(CatalogSnapshot { offerings });
+
+        let models: std::collections::BTreeSet<_> =
+            all_catalog_models_for_provider(ApiProvider::OpencodeGo)
+                .into_iter()
+                .collect();
+        let expected: std::collections::BTreeSet<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect();
+        assert_eq!(models, expected);
+        for messages_only in ["minimax-m3", "qwen3.7-max"] {
+            assert!(
+                catalog_offering_for_model(ApiProvider::OpencodeGo, messages_only).is_none(),
+                "saved/live {messages_only} row must not bypass the Chat-only lake cutline"
+            );
+        }
+        assert!(
+            catalog_offering_for_model(
+                ApiProvider::OpencodeGo,
+                crate::config::DEFAULT_OPENCODE_GO_MODEL,
+            )
+            .is_some()
+        );
+
+        clear_live_snapshot();
     }
 
     /// #4188: live > bundled > legacy fallback precedence, including live

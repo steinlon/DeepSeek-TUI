@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use codewhale_config::ProviderKind;
+use codewhale_config::{ProviderKind, opencode_go_chat_model_id};
 use serde::{Deserialize, Serialize};
 
 /// High-level model family used for shared identity affordances across clients.
@@ -982,6 +982,65 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // OpenCode Go Chat Completions models (https://opencode.ai/docs/go/).
+            // Go models documented only on `/messages` are intentionally not
+            // advertised by this OpenAI-compatible provider slice.
+            ModelInfo {
+                id: "deepseek-v4-pro".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/deepseek-v4-pro".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "glm-5.2".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/glm-5.2".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "glm-5.1".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/glm-5.1".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "kimi-k2.7-code".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/kimi-k2.7-code".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "kimi-k2.6".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/kimi-k2.6".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-v4-flash".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/deepseek-v4-flash".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "mimo-v2.5".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/mimo-v2.5".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "mimo-v2.5-pro".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/mimo-v2.5-pro".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             // Meta Model API / Muse Spark.
             ModelInfo {
                 id: "muse-spark-1.1".to_string(),
@@ -1097,7 +1156,31 @@ impl ModelRegistry {
                     fallback_chain,
                 };
             }
-            if let Some(provider) = provider_hint
+            // OpenCode Go's catalog spans Chat Completions and Anthropic
+            // Messages, while Codewhale's provider slice intentionally speaks
+            // Chat only. Resolve a hinted Go model through the shared Chat
+            // allowlist and never fall through to a same-named global alias on
+            // OpenRouter or MiniMax.
+            if provider_hint == Some(ProviderKind::OpencodeGo)
+                && let Some(canonical) = opencode_go_chat_model_id(name)
+                && let Some(model) = self
+                    .models
+                    .iter()
+                    .find(|model| {
+                        model.provider == ProviderKind::OpencodeGo
+                            && model.id.eq_ignore_ascii_case(canonical)
+                    })
+                    .cloned()
+            {
+                return ModelResolution {
+                    requested: Some(name.to_string()),
+                    resolved: model,
+                    used_fallback: false,
+                    fallback_chain,
+                };
+            }
+            if provider_hint != Some(ProviderKind::OpencodeGo)
+                && let Some(provider) = provider_hint
                 && let Some(model) = self
                     .models
                     .iter()
@@ -1141,7 +1224,9 @@ impl ModelRegistry {
                     fallback_chain,
                 };
             }
-            if let Some(idx) = self.alias_map.get(&normalize(name)) {
+            if provider_hint != Some(ProviderKind::OpencodeGo)
+                && let Some(idx) = self.alias_map.get(&normalize(name))
+            {
                 return ModelResolution {
                     requested: Some(name.to_string()),
                     resolved: preserve_requested_model_id_case(self.models[*idx].clone(), name),
@@ -1654,6 +1739,64 @@ mod tests {
                     .any(|model| model.provider == provider && model.id == id),
                 "expected {provider:?} model {id} in registry"
             );
+        }
+    }
+
+    #[test]
+    fn opencode_go_lists_only_current_chat_completions_models() {
+        let registry = ModelRegistry::default();
+        let listed = registry.list();
+        let models: Vec<&str> = listed
+            .iter()
+            .filter(|model| model.provider == ProviderKind::OpencodeGo)
+            .map(|model| model.id.as_str())
+            .collect();
+
+        assert_eq!(
+            models,
+            vec![
+                "deepseek-v4-pro",
+                "glm-5.2",
+                "glm-5.1",
+                "kimi-k2.7-code",
+                "kimi-k2.6",
+                "deepseek-v4-flash",
+                "mimo-v2.5",
+                "mimo-v2.5-pro",
+            ]
+        );
+
+        let default = registry.resolve(None, Some(ProviderKind::OpencodeGo));
+        assert_eq!(default.resolved.provider, ProviderKind::OpencodeGo);
+        assert_eq!(default.resolved.id, "deepseek-v4-pro");
+
+        let prefixed =
+            registry.resolve(Some("opencode-go/glm-5.2"), Some(ProviderKind::OpencodeGo));
+        assert_eq!(prefixed.resolved.provider, ProviderKind::OpencodeGo);
+        assert_eq!(prefixed.resolved.id, "glm-5.2");
+        assert!(!prefixed.used_fallback);
+
+        for messages_only in [
+            "minimax-m3",
+            "minimax-m2.7",
+            "minimax-m2.5",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.6-plus",
+        ] {
+            for requested in [
+                messages_only.to_string(),
+                format!("opencode-go/{messages_only}"),
+            ] {
+                let rejected = registry.resolve(Some(&requested), Some(ProviderKind::OpencodeGo));
+                assert!(rejected.used_fallback, "{requested}");
+                assert_eq!(
+                    rejected.resolved.provider,
+                    ProviderKind::OpencodeGo,
+                    "{requested} must not cross-route"
+                );
+                assert_eq!(rejected.resolved.id, "deepseek-v4-pro", "{requested}");
+            }
         }
     }
 

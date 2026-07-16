@@ -83,6 +83,11 @@ fn deepseek_api_key_reads_metadata_env_vars_for_newer_providers() -> Result<()> 
             "together-env-key",
         ),
         (ApiProvider::Qianfan, "QIANFAN_API_KEY", "qianfan-env-key"),
+        (
+            ApiProvider::OpencodeGo,
+            "OPENCODE_GO_API_KEY",
+            "opencode-go-env-key",
+        ),
     ];
     let _env_guards: Vec<_> = cases
         .iter()
@@ -136,6 +141,25 @@ context_window = 0
         .validate()
         .expect_err("zero context_window should be rejected");
     assert!(err.to_string().contains("providers.openai.context_window"));
+}
+
+#[test]
+fn opencode_go_context_window_zero_is_invalid() {
+    let config: Config = toml::from_str(
+        r#"
+[providers.opencode_go]
+context_window = 0
+"#,
+    )
+    .expect("zero is syntactically valid TOML");
+
+    let err = config
+        .validate()
+        .expect_err("zero OpenCode Go context_window should be rejected");
+    assert!(
+        err.to_string()
+            .contains("providers.opencode_go.context_window")
+    );
 }
 
 #[test]
@@ -4862,6 +4886,82 @@ fn model_completion_names_for_sakana_include_fugu_models() {
         model_completion_names_for_provider(ApiProvider::Sakana),
         vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL]
     );
+}
+
+#[test]
+fn opencode_go_config_uses_only_current_chat_completions_models() -> Result<()> {
+    let _lock = lock_test_env();
+    let _api_key = EnvVarGuard::remove("OPENCODE_GO_API_KEY");
+    let _base_url = EnvVarGuard::remove("OPENCODE_GO_BASE_URL");
+    let _model = EnvVarGuard::remove("OPENCODE_GO_MODEL");
+
+    let config: Config = toml::from_str(
+        r#"
+provider = "opencode_go"
+
+[providers.opencode_go]
+api_key = "go-config-key"
+model = "opencode-go/glm-5.2"
+"#,
+    )?;
+
+    assert_eq!(config.api_provider(), ApiProvider::OpencodeGo);
+    assert_eq!(config.deepseek_base_url(), DEFAULT_OPENCODE_GO_BASE_URL);
+    assert_eq!(config.default_model(), "glm-5.2");
+    assert_eq!(config.deepseek_api_key()?, "go-config-key");
+    assert_eq!(
+        wire_model_for_provider(ApiProvider::OpencodeGo, "opencode-go/mimo-v2.5-pro"),
+        "mimo-v2.5-pro"
+    );
+    assert_eq!(
+        model_completion_names_for_provider(ApiProvider::OpencodeGo),
+        OPENCODE_GO_CHAT_MODELS.to_vec()
+    );
+    for chat_model in OPENCODE_GO_CHAT_MODELS {
+        assert_eq!(
+            canonical_model_id_for_provider(ApiProvider::OpencodeGo, chat_model).as_deref(),
+            Some(*chat_model)
+        );
+        assert!(validate_route(ApiProvider::OpencodeGo, chat_model).is_ok());
+    }
+    for messages_only in [
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+    ] {
+        assert!(
+            !model_completion_names_for_provider(ApiProvider::OpencodeGo).contains(&messages_only),
+            "{messages_only} uses the Messages endpoint and must not be advertised"
+        );
+        assert!(
+            canonical_model_id_for_provider(ApiProvider::OpencodeGo, messages_only).is_none(),
+            "{messages_only} must not pass the explicit selector gate"
+        );
+        assert!(
+            requested_model_for_provider(ApiProvider::OpencodeGo, messages_only).is_none(),
+            "{messages_only} must not pass the runtime request gate"
+        );
+        assert!(validate_route(ApiProvider::OpencodeGo, messages_only).is_err());
+        assert_eq!(
+            wire_model_for_provider(ApiProvider::OpencodeGo, messages_only),
+            DEFAULT_OPENCODE_GO_MODEL,
+            "the infallible wire helper must fail closed to the Chat default"
+        );
+        assert_eq!(
+            wire_model_for_provider_route(
+                ApiProvider::OpencodeGo,
+                "https://go-gateway.example/v1",
+                messages_only,
+            ),
+            DEFAULT_OPENCODE_GO_MODEL,
+            "a base URL override must not bypass the Chat-only wire cutline"
+        );
+    }
+
+    Ok(())
 }
 
 #[test]
