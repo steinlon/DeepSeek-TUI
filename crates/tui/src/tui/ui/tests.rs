@@ -2119,6 +2119,41 @@ fn session_denied_cache_matches_only_approval_key() {
     assert!(is_session_denied_for_key(&app, "file:edit_file:retry"));
 }
 
+#[tokio::test]
+async fn session_denied_cache_auto_deny_explains_the_cached_rejection() {
+    let mut app = create_test_app();
+    let mut engine = mock_engine_handle();
+    let approval_key = "shell:exec_shell:git push secret-token";
+
+    auto_deny_session_approval(
+        &mut app,
+        &engine.handle,
+        "tool-retry",
+        "exec_shell",
+        approval_key,
+    )
+    .await;
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::Denied {
+            id: "tool-retry".to_string(),
+        })
+    );
+    let toast = app.status_toasts.back().expect("auto-deny warning toast");
+    assert_eq!(toast.level, StatusToastLevel::Warning);
+    assert_eq!(toast.ttl_ms, Some(12_000));
+    assert!(toast.text.contains("rejected this exact request earlier"));
+    assert!(toast.text.contains("Restart CodeWhale"));
+    assert!(toast.text.contains("exec_shell"));
+    assert!(
+        !toast.text.contains(approval_key)
+            && !toast.text.contains("git push")
+            && !toast.text.contains("secret-token"),
+        "the user-facing notice must not expose the approval key, command, or arguments"
+    );
+}
+
 #[test]
 fn session_approved_cache_keeps_tool_name_session_grants() {
     let mut app = create_test_app();

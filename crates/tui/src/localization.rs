@@ -688,6 +688,7 @@ pub enum MessageId {
     ApprovalChooseAction,
     ApprovalIntentLabel,
     ApprovalMoreLines,
+    ApprovalAutoDeniedSession,
     // Sandbox elevation dialog.
     ElevationTitleSandboxDenied,
     ElevationTitleRequired,
@@ -1598,6 +1599,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ApprovalChooseAction,
     MessageId::ApprovalIntentLabel,
     MessageId::ApprovalMoreLines,
+    MessageId::ApprovalAutoDeniedSession,
     MessageId::ElevationTitleSandboxDenied,
     MessageId::ElevationTitleRequired,
     MessageId::ElevationFieldTool,
