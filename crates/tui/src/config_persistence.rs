@@ -585,7 +585,7 @@ mod tests {
         codewhale_home: Option<OsString>,
         codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl EnvGuard {

@@ -1828,7 +1828,7 @@ mod tests {
         Config,
         (
             Vec<crate::test_support::EnvVarGuard>,
-            std::sync::MutexGuard<'static, ()>,
+            crate::test_support::TestEnvLock,
         ),
     ) {
         let lock = crate::test_support::lock_test_env();

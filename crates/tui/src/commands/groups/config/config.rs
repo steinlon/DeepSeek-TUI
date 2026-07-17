@@ -2324,7 +2324,7 @@ mod tests {
         no_animations: Option<OsString>,
         term_program: Option<OsString>,
         ptyxis_version: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl EnvGuard {

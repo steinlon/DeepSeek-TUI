@@ -311,7 +311,6 @@ mod tests {
     use crate::tui::app::{App, AppAction, SidebarFocus, TuiOptions};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     fn create_test_app() -> App {
@@ -1104,7 +1103,7 @@ mod tests {
 
     struct ConfigPathGuard {
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigPathGuard {

@@ -14638,13 +14638,12 @@ mod provider_key_validation_tests {
     use crate::core::engine::mock_engine_handle;
     use ratatui::{buffer::Buffer, layout::Rect};
     use std::ffi::OsString;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     struct ConfigPathEnvGuard {
         _tmp: TempDir,
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigPathEnvGuard {

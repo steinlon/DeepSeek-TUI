@@ -23,7 +23,7 @@ struct WorkspaceTrustConfigGuard {
     config_path: PathBuf,
     _codewhale_config_path: crate::test_support::EnvVarGuard,
     _deepseek_config_path: crate::test_support::EnvVarGuard,
-    _env_lock: std::sync::MutexGuard<'static, ()>,
+    _env_lock: crate::test_support::TestEnvLock,
 }
 
 fn workspace_trust_config_guard(workspace: &Path) -> WorkspaceTrustConfigGuard {

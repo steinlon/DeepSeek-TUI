@@ -718,7 +718,7 @@ mod tests {
     struct SettingsPathGuard {
         _tmp: TempDir,
         previous: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl SettingsPathGuard {
