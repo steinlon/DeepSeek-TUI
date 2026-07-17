@@ -102,14 +102,8 @@ impl TuiPrefs {
     pub fn path() -> Result<PathBuf> {
         // Honour the same env-var escape hatch used by Settings::path so that
         // integration tests can redirect all config I/O to a temp directory.
-        if let Ok(config_path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-            let config_path = config_path.trim();
-            if !config_path.is_empty() {
-                let p = expand_path(config_path);
-                if let Some(parent) = p.parent() {
-                    return Ok(parent.join("tui.toml"));
-                }
-            }
+        if let Some(parent) = legacy_config_override_parent() {
+            return Ok(parent.join("tui.toml"));
         }
 
         let primary = codewhale_config::codewhale_home()
@@ -1381,14 +1375,8 @@ fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathB
     // Allow tests to override the settings directory via the same env var
     // used for config (DEEPSEEK_CONFIG_PATH points at config.toml; the
     // settings file lives as a sibling in the same directory).
-    if let Ok(config_path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let config_path = config_path.trim();
-        if !config_path.is_empty() {
-            let p = expand_path(config_path);
-            if let Some(parent) = p.parent() {
-                return (Some(parent.join(SETTINGS_FILE_NAME)), None, None);
-            }
-        }
+    if let Some(parent) = legacy_config_override_parent() {
+        return (Some(parent.join(SETTINGS_FILE_NAME)), None, None);
     }
 
     let primary = codewhale_config::codewhale_home()
@@ -1404,6 +1392,26 @@ fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathB
         dirs::config_dir().map(|dir| dir.join("deepseek").join(SETTINGS_FILE_NAME));
 
     (primary, legacy_home, legacy_config_dir)
+}
+
+fn legacy_config_override_parent() -> Option<PathBuf> {
+    fn read() -> Option<PathBuf> {
+        let config_path = std::env::var("DEEPSEEK_CONFIG_PATH").ok()?;
+        let config_path = config_path.trim();
+        if config_path.is_empty() {
+            return None;
+        }
+        expand_path(config_path).parent().map(Path::to_path_buf)
+    }
+
+    #[cfg(test)]
+    {
+        crate::test_support::with_test_env_lock(read)
+    }
+    #[cfg(not(test))]
+    {
+        read()
+    }
 }
 
 fn migrate_settings_file_to_primary_if_needed(primary: &Path, active_read_path: &Path) {
@@ -2168,7 +2176,7 @@ mod tests {
     /// otherwise a `NO_ANIMATIONS=1` leak from this test family can
     /// flip a concurrent `TERM_PROGRAM=iTerm` test's `low_motion`
     /// assertion through the shared `apply_env_overrides` path.
-    fn no_animations_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn no_animations_test_guard() -> crate::test_support::TestEnvLock {
         crate::test_support::lock_test_env()
     }
 
@@ -2319,7 +2327,7 @@ mod tests {
     /// — otherwise a concurrent test that calls `animated_settings()`
     /// can read whatever value our two `set_var`s have raced into the
     /// env at that instant.
-    fn term_program_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn term_program_test_guard() -> crate::test_support::TestEnvLock {
         crate::test_support::lock_test_env()
     }
 
@@ -2988,7 +2996,7 @@ mod tests {
 
     /// Serialise tests that mutate `DEEPSEEK_CONFIG_PATH` through this guard
     /// so the parallel test runner doesn't observe interleaved env values.
-    fn config_path_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn config_path_test_guard() -> crate::test_support::TestEnvLock {
         crate::test_support::lock_test_env()
     }
 

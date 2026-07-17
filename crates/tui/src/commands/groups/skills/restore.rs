@@ -197,7 +197,6 @@ mod tests {
     use crate::config::Config;
     use crate::test_support::lock_test_env;
     use crate::tui::app::TuiOptions;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     fn make_app(tmp: &TempDir, yolo: bool) -> App {
@@ -231,7 +230,7 @@ mod tests {
     struct ScopedHome {
         prev: Option<std::ffi::OsString>,
         _home: TempDir,
-        _guard: MutexGuard<'static, ()>,
+        _guard: crate::test_support::TestEnvLock,
     }
     impl Drop for ScopedHome {
         fn drop(&mut self) {

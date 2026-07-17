@@ -31,7 +31,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -406,7 +405,7 @@ fn workflow_panel_uses_non_text_keys_for_controls() {
 struct ConfigPathEnvGuard {
     _tmp: TempDir,
     previous: Option<OsString>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: crate::test_support::TestEnvLock,
 }
 
 impl ConfigPathEnvGuard {
@@ -452,7 +451,7 @@ struct SettingsHomeGuard {
     previous_xdg_config_home: Option<OsString>,
     previous_appdata: Option<OsString>,
     previous_localappdata: Option<OsString>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: crate::test_support::TestEnvLock,
 }
 
 impl SettingsHomeGuard {

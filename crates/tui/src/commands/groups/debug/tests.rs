@@ -835,12 +835,11 @@ fn test_retry_truncates_long_input() {
 fn test_patch_undo_requests_session_resync_after_restore() {
     use crate::snapshot::SnapshotRepo;
     use crate::test_support::lock_test_env;
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl Drop for HomeGuard {
@@ -903,12 +902,11 @@ fn test_patch_undo_requests_session_resync_after_restore() {
 fn test_patch_undo_walks_back_to_older_snapshot_on_repeat() {
     use crate::snapshot::SnapshotRepo;
     use crate::test_support::lock_test_env;
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl Drop for HomeGuard {
@@ -962,12 +960,11 @@ fn test_patch_undo_walks_back_to_older_snapshot_on_repeat() {
 fn test_patch_undo_prunes_tool_turn_context() {
     use crate::snapshot::SnapshotRepo;
     use crate::test_support::lock_test_env;
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl Drop for HomeGuard {
@@ -1093,12 +1090,11 @@ fn test_patch_undo_prunes_tool_turn_context() {
 fn test_patch_undo_prunes_pre_turn_context() {
     use crate::snapshot::SnapshotRepo;
     use crate::test_support::lock_test_env;
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl Drop for HomeGuard {

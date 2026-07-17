@@ -767,7 +767,7 @@ mod tests {
     use tempfile::TempDir;
 
     struct IsolatedHome {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
         home_prev: Option<OsString>,
         userprofile_prev: Option<OsString>,
         test_home_prev: Option<std::path::PathBuf>,

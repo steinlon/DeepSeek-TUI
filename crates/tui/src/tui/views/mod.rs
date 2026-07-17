@@ -3835,7 +3835,6 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
     use unicode_width::UnicodeWidthStr;
 
@@ -4033,7 +4032,7 @@ mod tests {
     struct ConfigSettingsEnvGuard {
         _tmp: TempDir,
         previous_config_path: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigSettingsEnvGuard {
