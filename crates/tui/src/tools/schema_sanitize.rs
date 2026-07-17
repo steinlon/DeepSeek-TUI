@@ -825,7 +825,7 @@ mod tests {
             "properties": {
                 "path": {"type": "string"},
                 "patch": {"type": "string"},
-                "changes": {
+                "replace": {
                     "type": "array",
                     "items": {
                         "type": "object",
@@ -839,7 +839,7 @@ mod tests {
             },
             "oneOf": [
                 {"required": ["patch"]},
-                {"required": ["changes"]}
+                {"required": ["replace"]}
             ]
         });
 
@@ -852,10 +852,10 @@ mod tests {
         assert!(schema.get("enum").is_none());
         assert!(schema.get("not").is_none());
         assert!(schema["properties"].get("patch").is_some());
-        assert!(schema["properties"].get("changes").is_some());
+        assert!(schema["properties"].get("replace").is_some());
         assert_eq!(
             note.as_deref(),
-            Some("Exactly one of these parameter groups must be provided: `changes` | `patch`.")
+            Some("Exactly one of these parameter groups must be provided: `patch` | `replace`.")
         );
     }
 

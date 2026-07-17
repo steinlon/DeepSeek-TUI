@@ -179,7 +179,7 @@ struct HunkApplyStats {
 
 #[derive(Debug, Clone)]
 enum ApplyPatchPreflightKind {
-    Changes,
+    Replace,
     PathOverride { path: String, hunks: Vec<Hunk> },
     FilePatches(Vec<FilePatch>),
 }
@@ -226,7 +226,7 @@ impl ToolSpec for ApplyPatchTool {
                     "type": "string",
                     "description": "Unified diff patch content"
                 },
-                "changes": {
+                "replace": {
                     "type": "array",
                     "description": "Optional full file replacements (path + content).",
                     "items": {
@@ -249,7 +249,7 @@ impl ToolSpec for ApplyPatchTool {
             },
             "oneOf": [
                 { "required": ["patch"] },
-                { "required": ["changes"] }
+                { "required": ["replace"] }
             ]
         })
     }
@@ -269,11 +269,19 @@ impl ToolSpec for ApplyPatchTool {
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let fuzz = optional_u64(&input, "fuzz", DEFAULT_FUZZ as u64).min(MAX_FUZZ as u64);
         let fuzz = usize::try_from(fuzz).unwrap_or(DEFAULT_FUZZ);
+
+        // Reject ambiguous input: model may pass both 'patch' and 'replace' when it intends only one
+        if input.get("patch").is_some() && input.get("replace").is_some() {
+            return Err(ToolError::execution_failed(
+                "Cannot use both 'patch' and 'replace' simultaneously. Choose one.",
+            ));
+        }
+
         let create_if_missing = optional_bool(&input, "create_if_missing", false);
         let preflight = preflight_apply_patch_plan(&input)?;
 
-        if let Some(changes_value) = input.get("changes") {
-            let (pending, stats) = build_pending_writes_from_changes(changes_value, context)?;
+        if let Some(replace_value) = input.get("replace") {
+            let (pending, stats) = build_pending_writes_from_replace(replace_value, context)?;
             apply_pending_writes(&pending)?;
             // Resolve absolute paths for LSP diagnostics query.
             let abs_paths: Vec<PathBuf> = pending.iter().map(|p| p.path.clone()).collect();
@@ -302,8 +310,8 @@ impl ToolSpec for ApplyPatchTool {
         }
 
         let file_patches = match preflight.kind {
-            ApplyPatchPreflightKind::Changes => {
-                unreachable!("changes input returned before patch execution")
+            ApplyPatchPreflightKind::Replace => {
+                unreachable!("replace input returned before patch execution")
             }
             ApplyPatchPreflightKind::PathOverride { path, hunks } => vec![FilePatch {
                 path,
@@ -359,10 +367,10 @@ pub fn preflight_apply_patch(input: &Value) -> Result<ApplyPatchPreflight, ToolE
 fn preflight_apply_patch_plan(input: &Value) -> Result<ApplyPatchPreflightPlan, ToolError> {
     let create_if_missing = optional_bool(input, "create_if_missing", false);
 
-    if let Some(changes_value) = input.get("changes") {
+    if let Some(replace_value) = input.get("replace") {
         return Ok(ApplyPatchPreflightPlan {
-            summary: preflight_changes(changes_value)?,
-            kind: ApplyPatchPreflightKind::Changes,
+            summary: preflight_replace(replace_value)?,
+            kind: ApplyPatchPreflightKind::Replace,
         });
     }
 
@@ -443,12 +451,12 @@ fn preflight_apply_patch_plan(input: &Value) -> Result<ApplyPatchPreflightPlan, 
     })
 }
 
-fn preflight_changes(changes_value: &Value) -> Result<ApplyPatchPreflight, ToolError> {
-    let changes = changes_value.as_array().ok_or_else(|| {
-        ToolError::invalid_input("`changes` must be an array of objects like {path, content}")
+fn preflight_replace(replace_value: &Value) -> Result<ApplyPatchPreflight, ToolError> {
+    let changes = replace_value.as_array().ok_or_else(|| {
+        ToolError::invalid_input("`replace` must be an array of objects like {path, content}")
     })?;
     if changes.is_empty() {
-        return Err(ToolError::invalid_input("`changes` cannot be empty"));
+        return Err(ToolError::invalid_input("`replace` cannot be empty"));
     }
 
     let mut touched_files = Vec::new();
@@ -456,11 +464,11 @@ fn preflight_changes(changes_value: &Value) -> Result<ApplyPatchPreflight, ToolE
         let path = change
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::missing_field("changes[].path"))?;
+            .ok_or_else(|| ToolError::missing_field("replace[].path"))?;
         let _content = change
             .get("content")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::missing_field("changes[].content"))?;
+            .ok_or_else(|| ToolError::missing_field("replace[].content"))?;
         push_unique(&mut touched_files, path.to_string());
     }
 
@@ -849,15 +857,15 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     }
 }
 
-fn build_pending_writes_from_changes(
-    changes_value: &Value,
+fn build_pending_writes_from_replace(
+    replace_value: &Value,
     context: &ToolContext,
 ) -> Result<(Vec<PendingWrite>, PatchStatsExt), ToolError> {
-    let changes = changes_value.as_array().ok_or_else(|| {
-        ToolError::invalid_input("`changes` must be an array of objects like {path, content}")
+    let changes = replace_value.as_array().ok_or_else(|| {
+        ToolError::invalid_input("`replace` must be an array of objects like {path, content}")
     })?;
     if changes.is_empty() {
-        return Err(ToolError::invalid_input("`changes` cannot be empty"));
+        return Err(ToolError::invalid_input("`replace` cannot be empty"));
     }
 
     let mut pending = Vec::new();
@@ -866,11 +874,11 @@ fn build_pending_writes_from_changes(
         let path = change
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::missing_field("changes[].path"))?;
+            .ok_or_else(|| ToolError::missing_field("replace[].path"))?;
         let content = change
             .get("content")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::missing_field("changes[].content"))?;
+            .ok_or_else(|| ToolError::missing_field("replace[].content"))?;
 
         let resolved = context.resolve_path(path)?;
         let original = if resolved.exists() {
@@ -1368,7 +1376,7 @@ diff --git a/old.rs b/old.rs
     #[test]
     fn test_preflight_apply_patch_changes_list() {
         let preflight = preflight_apply_patch(&json!({
-            "changes": [
+            "replace": [
                 { "path": "one.txt", "content": "one" },
                 { "path": "two.txt", "content": "two" }
             ]
@@ -1383,7 +1391,7 @@ diff --git a/old.rs b/old.rs
     #[test]
     fn test_preflight_changes_files_total_counts_entries() {
         let preflight = preflight_apply_patch(&json!({
-            "changes": [
+            "replace": [
                 { "path": "same.txt", "content": "one" },
                 { "path": "same.txt", "content": "two" }
             ]
@@ -1663,7 +1671,7 @@ diff --git a/same.txt b/same.txt
         let result = tool
             .execute(
                 json!({
-                    "changes": [
+                    "replace": [
                         { "path": "one.txt", "content": "new\n" },
                         { "path": "two.txt", "content": "second\n" }
                     ]
@@ -1707,7 +1715,7 @@ diff --git a/same.txt b/same.txt
         let err = tool
             .execute(
                 json!({
-                    "changes": [
+                    "replace": [
                         { "path": "one.txt", "content": "new\n" },
                         { "path": "blocked/two.txt", "content": "second\n" }
                     ]

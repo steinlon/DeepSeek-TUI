@@ -1317,7 +1317,7 @@ fn parse_plan_input(input: &serde_json::Value) -> PlanSnapshot {
 }
 
 fn parse_patch_summary(input: &serde_json::Value) -> (String, String) {
-    if let Some(changes) = input.get("changes").and_then(|v| v.as_array()) {
+    if let Some(changes) = input.get("replace").and_then(|v| v.as_array()) {
         let count = changes.len();
         let path = changes
             .first()
@@ -1399,7 +1399,7 @@ pub(super) fn maybe_add_patch_preview(app: &mut App, input: &serde_json::Value) 
         return;
     }
 
-    if let Some(changes) = input.get("changes").and_then(|v| v.as_array()) {
+    if let Some(changes) = input.get("replace").and_then(|v| v.as_array()) {
         let preview = format_changes_preview(changes);
         if !preview.trim().is_empty() {
             app.add_message(HistoryCell::Tool(ToolCell::DiffPreview(DiffPreviewCell {

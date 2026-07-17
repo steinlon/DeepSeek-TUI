@@ -99,7 +99,7 @@ fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
             push_normalized(&mut targets, workspace, path);
         }
     }
-    if let Some(changes) = input.get("changes").and_then(Value::as_array) {
+    if let Some(changes) = input.get("replace").and_then(Value::as_array) {
         for change in changes {
             if let Some(path) = change.get("path").and_then(Value::as_str) {
                 push_normalized(&mut targets, workspace, path);
@@ -298,7 +298,7 @@ mod tests {
         let decision = repo_law_plan_decision(
             tmp.path(),
             "apply_patch",
-            &json!({"changes": [{"path": "crates/protocol/msg.rs"}]}),
+            &json!({"replace": [{"path": "crates/protocol/msg.rs"}]}),
         );
         assert!(matches!(decision, Some(RepoLawPlanDecision::Block(_))));
         // unified diff shape

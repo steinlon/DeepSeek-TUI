@@ -123,7 +123,7 @@ fn hash_patch_paths(input: &serde_json::Value) -> String {
 
     let mut paths: Vec<&str> = Vec::new();
 
-    if let Some(changes) = input.get("changes").and_then(|v| v.as_array()) {
+    if let Some(changes) = input.get("replace").and_then(|v| v.as_array()) {
         for change in changes {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 paths.push(path);
@@ -291,11 +291,11 @@ mod tests {
     fn grouping_key_collapses_patch_body_for_same_path() {
         let key_a = build_approval_grouping_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "x"}]}),
         );
         let key_b = build_approval_grouping_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "y"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "y"}]}),
         );
         assert_eq!(
             key_a, key_b,
@@ -320,11 +320,11 @@ mod tests {
     fn patch_keys_differ_by_path() {
         let key_a = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "x"}]}),
         );
         let key_b = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "b.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "b.rs", "content": "x"}]}),
         );
         assert_ne!(key_a, key_b);
     }
@@ -333,11 +333,11 @@ mod tests {
     fn patch_keys_differ_by_body_for_same_path() {
         let key_a = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "x"}]}),
         );
         let key_b = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "y"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "y"}]}),
         );
         assert_ne!(key_a, key_b);
     }

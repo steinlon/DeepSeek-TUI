@@ -8237,7 +8237,7 @@ fn edited_paths_for_write_file_returns_path() {
 #[test]
 fn edited_paths_for_apply_patch_with_changes_returns_each_path() {
     let input = json!({
-        "changes": [
+        "replace": [
             { "path": "a.rs", "content": "" },
             { "path": "b.rs", "content": "" }
         ]
