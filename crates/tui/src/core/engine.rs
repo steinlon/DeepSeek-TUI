@@ -4121,6 +4121,7 @@ pub(crate) struct MockEngineHandle {
     pub handle: EngineHandle,
     pub rx_op: mpsc::Receiver<Op>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
+    rx_user_input: mpsc::Receiver<UserInputDecision>,
     pub rx_steer: mpsc::Receiver<String>,
     pub tx_event: mpsc::Sender<Event>,
     pub cancel_token: CancellationToken,
@@ -4152,6 +4153,22 @@ impl MockEngineHandle {
             }
         }
     }
+
+    pub(crate) async fn recv_user_input_submission(
+        &mut self,
+    ) -> Option<(String, UserInputResponse)> {
+        match self.rx_user_input.recv().await? {
+            UserInputDecision::Submitted { id, response } => Some((id, response)),
+            UserInputDecision::Cancelled { .. } => None,
+        }
+    }
+
+    pub(crate) async fn recv_user_input_cancellation(&mut self) -> Option<String> {
+        match self.rx_user_input.recv().await? {
+            UserInputDecision::Cancelled { id } => Some(id),
+            UserInputDecision::Submitted { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4159,7 +4176,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_op, rx_op) = mpsc::channel(32);
     let (tx_event, rx_event) = mpsc::channel(256);
     let (tx_approval, rx_approval) = mpsc::channel(64);
-    let (tx_user_input, _rx_user_input) = mpsc::channel(32);
+    let (tx_user_input, rx_user_input) = mpsc::channel(32);
     let (tx_steer, rx_steer) = mpsc::channel(64);
     let cancel_token = CancellationToken::new();
     let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
@@ -4181,6 +4198,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
         handle,
         rx_op,
         rx_approval,
+        rx_user_input,
         rx_steer,
         tx_event,
         cancel_token,

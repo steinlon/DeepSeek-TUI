@@ -3358,6 +3358,13 @@ async fn approval_required_awaits_external_decision_allow() -> Result<()> {
     }
     assert_eq!(manager.pending_approvals_count(), 1);
 
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    assert_eq!(detail.pending_approvals.len(), 1);
+    assert_eq!(detail.pending_approvals[0].id, "tool_external_allow");
+    assert_eq!(detail.pending_approvals[0].turn_id, _turn.id);
+    assert_eq!(detail.pending_approvals[0].tool_name, "exec_command");
+    assert_eq!(detail.pending_user_inputs.len(), 0);
+
     let events = manager.events_since(&thread.id, None)?;
     let approval_event = events
         .iter()
@@ -3383,6 +3390,13 @@ async fn approval_required_awaits_external_decision_allow() -> Result<()> {
         })
     );
     assert_eq!(manager.pending_approvals_count(), 0);
+    assert!(
+        manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_approvals
+            .is_empty()
+    );
 
     harness
         .tx_event
@@ -3394,6 +3408,216 @@ async fn approval_required_awaits_external_decision_allow() -> Result<()> {
             base_url: None,
         })
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "needs a choice".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+
+    harness
+        .tx_event
+        .send(EngineEvent::UserInputRequired {
+            id: "input_reload".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: vec![crate::tools::user_input::UserInputQuestion {
+                    header: "Continue".to_string(),
+                    id: "continue".to_string(),
+                    question: "Continue with the check?".to_string(),
+                    options: vec![
+                        crate::tools::user_input::UserInputOption {
+                            label: "Yes".to_string(),
+                            description: "Continue now".to_string(),
+                        },
+                        crate::tools::user_input::UserInputOption {
+                            label: "No".to_string(),
+                            description: "Stop here".to_string(),
+                        },
+                    ],
+                    allow_free_text: false,
+                    multi_select: false,
+                }],
+            },
+        })
+        .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let detail = loop {
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        if !detail.pending_user_inputs.is_empty() {
+            break detail;
+        }
+        if Instant::now() >= deadline {
+            bail!("pending user input did not reach the canonical snapshot");
+        }
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(detail.pending_approvals.len(), 0);
+    assert_eq!(detail.pending_user_inputs.len(), 1);
+    assert_eq!(detail.pending_user_inputs[0].id, "input_reload");
+    assert_eq!(detail.pending_user_inputs[0].turn_id, turn.id);
+    assert_eq!(
+        detail.pending_user_inputs[0].request.questions[0].question,
+        "Continue with the check?"
+    );
+
+    manager
+        .submit_user_input(
+            &thread.id,
+            "input_reload",
+            crate::tools::user_input::UserInputResponse {
+                answers: vec![crate::tools::user_input::UserInputAnswer {
+                    id: "continue".to_string(),
+                    label: "Yes".to_string(),
+                    value: "Yes".to_string(),
+                }],
+            },
+        )
+        .await?;
+    match harness.recv_user_input_submission().await {
+        Some((id, response)) => {
+            assert_eq!(id, "input_reload");
+            assert_eq!(response.answers[0].id, "continue");
+        }
+        other => panic!("expected submitted user input, got {other:?}"),
+    }
+    assert!(
+        manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_user_inputs
+            .is_empty()
+    );
+    assert!(manager.events_since(&thread.id, None)?.iter().any(|event| {
+        event.event == "user_input.answered"
+            && event.payload.get("input_id").and_then(Value::as_str) == Some("input_reload")
+    }));
+
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_turn_cancels_pending_user_input_and_clears_snapshot() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "needs input before completion".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::UserInputRequired {
+            id: "input_terminal".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: vec![crate::tools::user_input::UserInputQuestion {
+                    header: "Continue".to_string(),
+                    id: "continue".to_string(),
+                    question: "Continue?".to_string(),
+                    options: vec![crate::tools::user_input::UserInputOption {
+                        label: "Yes".to_string(),
+                        description: "Continue now".to_string(),
+                    }],
+                    allow_free_text: false,
+                    multi_select: false,
+                }],
+            },
+        })
+        .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_user_inputs
+            .is_empty()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("pending user input did not reach the canonical snapshot");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let canceled = tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.recv_user_input_cancellation(),
+    )
+    .await
+    .expect("terminal user-input cancellation timed out");
+    assert_eq!(canceled.as_deref(), Some("input_terminal"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        if detail.pending_user_inputs.is_empty()
+            && manager.events_since(&thread.id, None)?.iter().any(|event| {
+                event.event == "user_input.canceled"
+                    && event.turn_id.as_deref() == Some(turn.id.as_str())
+                    && event.payload.get("input_id").and_then(Value::as_str)
+                        == Some("input_terminal")
+                    && event.payload.get("terminal").and_then(Value::as_bool) == Some(true)
+            })
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "terminal user input was not cleared from the snapshot with a cancellation event"
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
     Ok(())
 }
 
