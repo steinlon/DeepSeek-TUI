@@ -10,9 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{Path, Query, Request, State};
-#[cfg(test)]
 use axum::http::header;
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -29,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 #[cfg(test)]
 use crate::dependencies::ExternalTool;
@@ -2949,7 +2948,13 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(Any)
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static("x-codewhale-runtime-token"),
+            HeaderName::from_static("x-deepseek-runtime-token"),
+        ])
 }
 
 fn map_task_err(err: anyhow::Error) -> ApiError {

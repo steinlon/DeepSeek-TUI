@@ -5042,3 +5042,61 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
     handle.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn cors_layer_advertises_only_supported_request_headers() -> Result<()> {
+    let layer = cors_layer(&[]);
+    let router: Router = Router::new()
+        .route("/probe", get(|| async { "ok" }))
+        .layer(layer);
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+        .header("Origin", "http://localhost:1420")
+        .header("Access-Control-Request-Method", "GET")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization, content-type, accept, x-codewhale-runtime-token, x-deepseek-runtime-token, x-malicious-header",
+        )
+        .send()
+        .await?;
+
+    assert!(resp.status().is_success());
+    let allow_headers = resp
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let advertised = allow_headers
+        .split(',')
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "accept",
+        "authorization",
+        "content-type",
+        "x-codewhale-runtime-token",
+        "x-deepseek-runtime-token",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(advertised, expected);
+
+    handle.abort();
+    Ok(())
+}
