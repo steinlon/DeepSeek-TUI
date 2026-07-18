@@ -1,9 +1,10 @@
-//! Persistent enable/disable state for runtime API skill listings.
+//! Persistent enable/disable state shared by runtime/API Skill catalogs.
 //!
 //! Backs `GET /v1/skills` (`enabled` field per skill) and
-//! `POST /v1/skills/{name}` (toggle). This is separate from the
-//! filesystem-discovered `SkillRegistry`: the registry tells us which skills
-//! exist on disk, and this store tells API clients which ones are marked active.
+//! `POST /v1/skills/{name}` (toggle). Discovery tells us which Skills exist;
+//! this store is the final exact-name activation filter shared by prompts,
+//! tools, TUI surfaces, sub-agents, and the API. Plugin trust/enablement stays
+//! a separate bundle lifecycle gate.
 //!
 //! Storage shape (TOML at `~/.codewhale/skills_state.toml`, legacy `~/.deepseek/skills_state.toml`):
 //!
@@ -104,9 +105,11 @@ impl SkillStateStore {
 }
 
 fn default_state_path() -> Result<PathBuf> {
-    let dir = codewhale_config::ensure_state_dir(".")
-        .context("could not resolve or create Codewhale state directory")?;
-    Ok(dir.join(STATE_FILE_NAME))
+    // Listing, prompt construction, and doctor are read-only. The explicit
+    // mutation path creates the parent from `persist` when needed.
+    Ok(codewhale_config::codewhale_home()
+        .context("could not resolve Codewhale state directory")?
+        .join(STATE_FILE_NAME))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {

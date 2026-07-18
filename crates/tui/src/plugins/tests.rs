@@ -173,6 +173,17 @@ fn aba_source_skill_body_is_replaced_by_the_staged_snapshot_before_activation() 
     assert!(active.active());
     assert!(active.skill_snapshots[0].body.contains("body A"));
     assert!(!active.skill_snapshots[0].body.contains("body B"));
+    let staged_bytes = fs::read(&active.skill_snapshots[0].path).unwrap();
+    let mut digest = sha2::Sha256::new();
+    use sha2::Digest as _;
+    digest.update(b"codewhale-plugin-file-bytes-v1\0");
+    digest.update(staged_bytes);
+    let staged_hash = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(active.skill_snapshots[0].source_hash, staged_hash);
     assert!(
         active.skill_snapshots[0]
             .path
@@ -344,7 +355,7 @@ fn staging_is_owner_only_and_uses_the_reviewed_executable_shape() {
     assert_ne!(staged, &plugin);
     assert_eq!(
         fs::metadata(staged).unwrap().permissions().mode() & 0o777,
-        0o700
+        0o500
     );
     assert_eq!(
         fs::metadata(staged.join("plugin.toml"))
@@ -362,6 +373,90 @@ fn staging_is_owner_only_and_uses_the_reviewed_executable_shape() {
             & 0o777,
         0o500
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_does_not_rewrite_existing_state_or_lock_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+    fs::create_dir_all(config.state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &config.state_path,
+        "{\"schema_version\":1,\"plugins\":{}}\n",
+    )
+    .unwrap();
+    let lock = config.state_path.with_file_name("plugin-state.json.lock");
+    fs::write(&lock, b"sentinel").unwrap();
+    fs::set_permissions(&config.state_path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+
+    let state_before = fs::metadata(&config.state_path).unwrap();
+    let lock_before = fs::metadata(&lock).unwrap();
+    let state_body = fs::read(&config.state_path).unwrap();
+    let lock_body = fs::read(&lock).unwrap();
+    let registry = discover_with_config(&config);
+
+    assert!(registry.state_error().is_none());
+    assert_eq!(fs::read(&config.state_path).unwrap(), state_body);
+    assert_eq!(fs::read(&lock).unwrap(), lock_body);
+    assert_eq!(
+        fs::metadata(&config.state_path)
+            .unwrap()
+            .permissions()
+            .mode(),
+        state_before.permissions().mode()
+    );
+    assert_eq!(
+        fs::metadata(&lock).unwrap().permissions().mode(),
+        lock_before.permissions().mode()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_rejects_linked_state_and_lock_without_touching_targets() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    for linked_entry in ["state", "lock"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config(tmp.path());
+        write_plugin(&config, "");
+        fs::create_dir_all(config.state_path.parent().unwrap()).unwrap();
+        let target = tmp.path().join(format!("{linked_entry}-target"));
+        fs::write(&target, "{\"schema_version\":1,\"plugins\":{}}\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let target_before = fs::read(&target).unwrap();
+        let target_mode = fs::metadata(&target).unwrap().permissions().mode();
+        if linked_entry == "state" {
+            symlink(&target, &config.state_path).unwrap();
+        } else {
+            fs::write(
+                &config.state_path,
+                "{\"schema_version\":1,\"plugins\":{}}\n",
+            )
+            .unwrap();
+            symlink(
+                &target,
+                config.state_path.with_file_name("plugin-state.json.lock"),
+            )
+            .unwrap();
+        }
+
+        let registry = discover_with_config(&config);
+        assert!(
+            registry.state_error().is_some(),
+            "linked {linked_entry} must fail closed"
+        );
+        assert_eq!(fs::read(&target).unwrap(), target_before);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode(),
+            target_mode
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -157,6 +157,9 @@ pub struct PluginSkillSnapshot {
     pub localized_descriptions: HashMap<String, String>,
     pub body: String,
     pub path: PathBuf,
+    /// Digest of the exact UTF-8 bytes parsed into this snapshot. This is the
+    /// corresponding entry in the reviewed bundle's file-hash inventory.
+    pub source_hash: String,
 }
 
 #[derive(Debug, Clone)]

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -457,7 +457,7 @@ impl PluginRegistry {
 
 fn load_state(path: &Path) -> Result<PluginStateFile, String> {
     let lock_path = state_lock_path(path);
-    if lock_path.exists() {
+    if path_entry_exists(&lock_path)? {
         let lock_file = open_state_lock(&lock_path, false)?;
         let lock = fd_lock::RwLock::new(lock_file);
         let _guard = lock
@@ -469,10 +469,11 @@ fn load_state(path: &Path) -> Result<PluginStateFile, String> {
 }
 
 fn load_state_unlocked(path: &Path) -> Result<PluginStateFile, String> {
-    if !path.exists() {
+    let Some(mut file) = open_existing_regular_file(path, false)? else {
         return Ok(PluginStateFile::default());
-    }
-    let raw = std::fs::read_to_string(path)
+    };
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let state: PluginStateFile = serde_json::from_str(&raw)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
@@ -513,13 +514,109 @@ fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Open the reparse point itself. `validate_opened_regular_file` then
+        // rejects it instead of following it to an unrelated ACL target.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     }
     let file = options
         .open(path)
         .map_err(|e| format!("failed to open plugin state lock: {e}"))?;
-    harden_plugin_state_file(path)?;
+    validate_opened_regular_file(path, &file)?;
+    // Discovery/doctor opens existing locks with `create=false` and must be
+    // byte-for-byte and descriptor-for-descriptor non-mutating. ACL/mode
+    // hardening belongs only to trust/enable/disable/revoke updates.
+    if create {
+        harden_plugin_state_file(path)?;
+    }
     Ok(file)
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+/// Open an existing state file without following its final link/reparse point.
+/// `None` is returned only for a genuinely absent entry; an existing unsafe
+/// object always fails closed.
+fn open_existing_regular_file(path: &Path, write: bool) -> Result<Option<fs::File>, String> {
+    if !path_entry_exists(path)? {
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("failed to open {} safely: {e}", path.display()))?;
+    validate_opened_regular_file(path, &file)?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect opened {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(format!(
+            "{} must be one regular, non-hard-linked file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect opened {}: {e}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.number_of_links() != 1
+    {
+        return Err(format!(
+            "{} must be one regular, non-reparse, non-hard-linked file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect opened {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} must be a regular file", path.display()));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -589,16 +686,16 @@ fn stage_bundle(state_path: &Path, plugin: &LoadedPlugin) -> Result<PathBuf, Str
         .map_err(|e| format!("failed to create plugin state directory: {e}"))?;
     let destination = runtime_stage_path(state_path, &plugin.id, &plugin.content_hash);
     if destination.exists() {
-        return staged_bundle_matches(
-            &destination,
-            &plugin.content_hash,
-            &plugin.capability_hash,
-        )
-        .then(|| destination.canonicalize().unwrap_or(destination))
-        .ok_or_else(|| {
-            "Existing Codewhale plugin runtime snapshot failed content validation; remove the exact .runtime entry and review again"
-                .to_string()
-        });
+        if !staged_bundle_matches(&destination, &plugin.content_hash, &plugin.capability_hash) {
+            return Err(
+                "Existing Codewhale plugin runtime snapshot failed content validation; remove the exact .runtime entry and review again"
+                    .to_string(),
+            );
+        }
+        // Trust is a mutating boundary, so it may upgrade an older verified
+        // snapshot to the finalized non-writable permission contract.
+        harden_staged_tree(&destination)?;
+        return Ok(destination.canonicalize().unwrap_or(destination));
     }
 
     let parent = destination
@@ -618,22 +715,33 @@ fn stage_bundle(state_path: &Path, plugin: &LoadedPlugin) -> Result<PathBuf, Str
                     .to_string(),
             );
         }
-        harden_staged_tree(&temporary)?;
-        fs::rename(&temporary, &destination).map_err(|e| {
-            format!("failed to activate content-addressed plugin runtime snapshot: {e}")
-        })?;
+        // Finalize descendants before activation, but keep the temporary root
+        // owner-writable through the atomic rename. macOS rejects renaming a
+        // directory whose own mode is already 0500 even when both parents are
+        // writable. The destination root is hardened immediately after the
+        // rename, before its path is returned or persisted as authority.
+        harden_staged_tree_contents(&temporary)?;
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            // Another process may have won the same content-addressed race.
+            // Reuse only after exact validation and hardening at this explicit
+            // mutation boundary; every other rename failure remains fatal.
+            if staged_bundle_matches(&destination, &plugin.content_hash, &plugin.capability_hash) {
+                harden_staged_tree(&destination)?;
+                return destination.canonicalize().map_err(|e| {
+                    format!("failed to finalize raced plugin runtime snapshot path: {e}")
+                });
+            }
+            return Err(format!(
+                "failed to activate content-addressed plugin runtime snapshot: {error}"
+            ));
+        }
+        set_staged_read_only_directory(&destination)?;
         destination
             .canonicalize()
             .map_err(|e| format!("failed to finalize plugin runtime snapshot path: {e}"))
     })();
     if staged.is_err() && temporary.exists() {
         let _ = fs::remove_dir_all(&temporary);
-    }
-    if staged.is_err()
-        && destination.exists()
-        && staged_bundle_matches(&destination, &plugin.content_hash, &plugin.capability_hash)
-    {
-        return Ok(destination);
     }
     staged
 }
@@ -724,12 +832,21 @@ fn copy_bundle_tree_bounded(
     use std::io::Read as _;
     let metadata = fs::symlink_metadata(source)
         .map_err(|e| format!("failed to inspect plugin content during staging: {e}"))?;
-    if metadata.file_type().is_symlink() {
+    if registry_metadata_is_link_or_reparse(&metadata) {
         return Err("Plugin content changed into a symbolic link during staging".to_string());
     }
     if !metadata.is_dir() {
         return Err("Plugin runtime source is not a directory".to_string());
     }
+    #[cfg(windows)]
+    let source_guard = open_windows_bundle_directory(source)?;
+    #[cfg(windows)]
+    ensure_windows_registry_identity(
+        &metadata,
+        &source_guard.metadata().map_err(|e| {
+            format!("failed to inspect opened plugin directory during staging: {e}")
+        })?,
+    )?;
     let mut entries = fs::read_dir(source)
         .map_err(|e| format!("failed to read plugin content during staging: {e}"))?
         .collect::<Result<Vec<_>, _>>()
@@ -740,7 +857,7 @@ fn copy_bundle_tree_bounded(
         let destination_path = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&source_path)
             .map_err(|e| format!("failed to inspect plugin entry during staging: {e}"))?;
-        if metadata.file_type().is_symlink() {
+        if registry_metadata_is_link_or_reparse(&metadata) {
             return Err("Plugin content may not contain symbolic links".to_string());
         }
         if metadata.is_dir() {
@@ -755,6 +872,13 @@ fn copy_bundle_tree_bounded(
             }
             let mut source_file = super::manifest::open_bundle_file(&source_path)
                 .map_err(|e| format!("failed to open plugin file without following links: {e}"))?;
+            #[cfg(windows)]
+            ensure_windows_registry_identity(
+                &metadata,
+                &source_file.metadata().map_err(|e| {
+                    format!("failed to inspect opened plugin file during staging: {e}")
+                })?,
+            )?;
             let mut destination_file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -780,13 +904,80 @@ fn copy_bundle_tree_bounded(
                 .sync_all()
                 .map_err(|e| format!("failed to sync staged plugin file: {e}"))?;
             preserve_owner_only_file_mode(&destination_path, &metadata)?;
+            #[cfg(windows)]
+            ensure_windows_registry_path_still_opened(&source_path, &source_file)?;
         } else {
             return Err(
                 "Plugin content must contain only regular files and directories".to_string(),
             );
         }
     }
+    #[cfg(windows)]
+    ensure_windows_registry_path_still_opened(source, &source_guard)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_bundle_directory(path: &Path) -> Result<fs::File, String> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        .open(path)
+        .map_err(|e| format!("failed to open plugin directory safely: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect opened plugin directory: {e}"))?;
+    if !metadata.is_dir() || metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err("Plugin directory changed into a reparse point during staging".to_string());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn ensure_windows_registry_identity(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let before_id = (before.volume_serial_number(), before.file_index());
+    let opened_id = (opened.volume_serial_number(), opened.file_index());
+    if before_id.0.is_none() || before_id.1.is_none() || before_id != opened_id {
+        return Err("Plugin path identity changed while staging".to_string());
+    }
+    if opened.is_file() && opened.number_of_links() != Some(1) {
+        return Err("Plugin content may not contain hard-linked files".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_registry_path_still_opened(path: &Path, opened: &fs::File) -> Result<(), String> {
+    let after = fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to re-inspect staged source path: {e}"))?;
+    if registry_metadata_is_link_or_reparse(&after) {
+        return Err("Plugin path changed into a reparse point during staging".to_string());
+    }
+    ensure_windows_registry_identity(
+        &after,
+        &opened
+            .metadata()
+            .map_err(|e| format!("failed to inspect retained source handle: {e}"))?,
+    )
+}
+
+#[cfg(windows)]
+fn registry_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn registry_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(unix)]
@@ -993,13 +1184,65 @@ fn harden_staged_tree(path: &Path) -> Result<(), String> {
         for entry in entries {
             harden_staged_tree(&entry.path())?;
         }
-        set_owner_only_directory(path)?;
+        set_staged_read_only_directory(path)?;
     } else if metadata.is_file() {
-        preserve_owner_only_file_mode(path, &metadata)?;
+        set_staged_read_only_file(path, &metadata)?;
     } else {
         return Err("Staged plugin content changed type before activation".to_string());
     }
     Ok(())
+}
+
+fn harden_staged_tree_contents(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to harden staged plugin root: {e}"))?;
+    if !metadata.is_dir() {
+        return Err("Staged plugin root changed type before activation".to_string());
+    }
+    let entries = fs::read_dir(path)
+        .map_err(|e| format!("failed to read staged plugin root: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to enumerate staged plugin root: {e}"))?;
+    for entry in entries {
+        harden_staged_tree(&entry.path())?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_staged_read_only_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+        .map_err(|e| format!("failed to make staged plugin directory non-writable: {e}"))
+}
+
+#[cfg(windows)]
+fn set_staged_read_only_directory(path: &Path) -> Result<(), String> {
+    // GENERIC_READ | GENERIC_EXECUTE. The owner can inspect/traverse the
+    // finalized stage but ordinary child processes cannot rewrite it through
+    // inherited full-control directory ACEs.
+    set_windows_owner_only_acl_with_mask(path, 0xa000_0000)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn set_staged_read_only_directory(_path: &Path) -> Result<(), String> {
+    Err("Plugin runtime staging cannot make directories non-writable on this platform".to_string())
+}
+
+#[cfg(unix)]
+fn set_staged_read_only_file(path: &Path, source: &fs::Metadata) -> Result<(), String> {
+    preserve_owner_only_file_mode(path, source)
+}
+
+#[cfg(windows)]
+fn set_staged_read_only_file(path: &Path, source: &fs::Metadata) -> Result<(), String> {
+    preserve_owner_only_file_mode(path, source)?;
+    set_windows_owner_only_acl_with_mask(path, 0xa000_0000)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn set_staged_read_only_file(path: &Path, source: &fs::Metadata) -> Result<(), String> {
+    preserve_owner_only_file_mode(path, source)
 }
 
 #[cfg(unix)]
@@ -1020,6 +1263,11 @@ fn set_owner_only_directory(path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn set_windows_owner_only_acl(path: &Path) -> Result<(), String> {
+    set_windows_owner_only_acl_with_mask(path, 0x001f_01ff)
+}
+
+#[cfg(windows)]
+fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result<(), String> {
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
@@ -1081,7 +1329,7 @@ fn set_windows_owner_only_acl(path: &Path) -> Result<(), String> {
                 acl,
                 ACL_REVISION,
                 CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-                0x001f_01ff,
+                access_mask,
                 sid,
             )
         }

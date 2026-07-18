@@ -110,7 +110,8 @@ impl ToolSpec for LoadSkillTool {
                 discovery_mode,
                 context.plugin_registry.as_deref(),
             )
-        };
+        }
+        .into_enabled();
         let Some(skill) = registry.get(name) else {
             let available: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
             let hint = if available.is_empty() {

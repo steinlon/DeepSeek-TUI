@@ -531,6 +531,21 @@ impl SkillRegistry {
         })
     }
 
+    /// Parse one already-read Skill body while preserving the same name
+    /// normalization contract as filesystem discovery. Plugin discovery uses
+    /// this after checking the exact byte digest against its reviewed bundle
+    /// inventory, so parsing never has to reopen the mutable pathname.
+    pub(crate) fn parse_verified_content(
+        path: &Path,
+        content: &str,
+    ) -> std::result::Result<(Skill, Vec<String>), String> {
+        let mut registry = Self::default();
+        let mut skill = Self::parse_skill(path, content)?;
+        skill.path = path.to_path_buf();
+        registry.normalize_skill_name(&mut skill, path);
+        Ok((skill, registry.warnings))
+    }
+
     /// Lookup a skill by name.
     pub fn get(&self, name: &str) -> Option<&Skill> {
         let normalized = normalize_skill_name_for_lookup(name);
@@ -540,6 +555,20 @@ impl SkillRegistry {
     /// Return all loaded skills.
     pub fn list(&self) -> &[Skill] {
         &self.skills
+    }
+
+    /// Apply the shared exact-name activation state after filesystem/plugin
+    /// discovery. A qualified plugin Skill can be hidden independently, but
+    /// this never changes the plugin bundle's trust or MCP lifecycle.
+    #[must_use]
+    pub(crate) fn into_enabled(mut self) -> Self {
+        match crate::skill_state::SkillStateStore::load_default() {
+            Ok(state) => self.skills.retain(|skill| state.is_enabled(&skill.name)),
+            Err(error) => self.push_warning(format!(
+                "Failed to read Skill activation state; leaving discovered Skills enabled: {error}"
+            )),
+        }
+        self
     }
 
     /// Parse or I/O warnings encountered while discovering skills.
@@ -811,6 +840,7 @@ fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn discover_from_directories(dirs: impl IntoIterator<Item = PathBuf>) -> SkillRegistry {
     discover_from_directories_with_plugins(dirs, None)
 }
@@ -1008,7 +1038,8 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode(
     locale: &str,
 ) -> Option<String> {
     let registry =
-        discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, None);
+        discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, None)
+            .into_enabled();
     render_skills_block(&registry, locale)
 }
 
@@ -1021,7 +1052,8 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode_and_plugi
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> Option<String> {
     let registry =
-        discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, plugins);
+        discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, plugins)
+            .into_enabled();
     render_skills_block(&registry, locale)
 }
 

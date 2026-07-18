@@ -192,7 +192,7 @@ fn mcp_pool_parse_prefixed_name_rejects_ambiguous_configured_server_prefixes() {
     let error = pool
         .parse_prefixed_name("mcp_my_db_execute_sql")
         .expect_err("configured server-prefix collisions must fail closed");
-    assert!(error.to_string().contains("Ambiguous MCP tool name"));
+    assert!(error.to_string().contains("Unknown MCP tool name"));
 }
 
 #[test]
@@ -1194,7 +1194,13 @@ connect_timeout = 1
 #[cfg(unix)]
 #[tokio::test]
 async fn plugin_mcp_inflight_call_is_cancelled_after_cross_process_revocation() {
+    let _env_lock = crate::test_support::lock_test_env();
     let dir = tempfile::tempdir().unwrap();
+    let call_marker = dir.path().join("call.marker");
+    let _call_marker_env = crate::test_support::EnvVarGuard::set(
+        "CODEWHALE_TEST_PLUGIN_CALL_MARKER",
+        call_marker.as_os_str(),
+    );
     let plugins_root = dir.path().join("plugins");
     let plugin_base = plugins_root.join("revoked");
     fs::create_dir_all(&plugin_base).unwrap();
@@ -1214,7 +1220,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"tools":[{"name":"wait","description":"Wait until revoked","inputSchema":{"type":"object"}}]}}'
             ;;
         *'"method":"tools/call"'*)
-            : > call.marker
+            : > "$CALL_MARKER"
             while :; do sleep 1; done
             ;;
     esac
@@ -1236,6 +1242,9 @@ args = ["server.sh"]
 connect_timeout = 2
 execute_timeout = 30
 read_timeout = 30
+
+[mcp_servers.local.env]
+CALL_MARKER = "${CODEWHALE_TEST_PLUGIN_CALL_MARKER}"
 "#,
     )
     .unwrap();
@@ -1252,11 +1261,6 @@ read_timeout = 30
     registry.enable("revoked").unwrap();
     let active = registry.active_plugins()[0].clone();
     let authority = registry.authority_for("revoked").unwrap();
-    let call_marker = authority
-        .staged_manifest
-        .parent()
-        .unwrap()
-        .join("call.marker");
     let merged = merge_plugin_mcp_servers_from_plugins(
         McpConfig::default(),
         vec![("revoked".to_string(), active, authority)],
@@ -1272,6 +1276,12 @@ read_timeout = 30
     for _ in 0..100 {
         if call_marker.exists() {
             break;
+        }
+        if call.is_finished() {
+            let early = call
+                .await
+                .expect("in-flight tool task panicked before reaching the server");
+            panic!("in-flight tool call ended before reaching the server: {early:?}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -2221,6 +2231,7 @@ fn test_connection(transport: Box<dyn McpTransport>) -> McpConnection {
         cancel_token: tokio_util::sync::CancellationToken::new(),
         authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
         authority_watch: None,
+        catalog_generation: 0,
     }
 }
 
@@ -2767,6 +2778,85 @@ async fn mcp_pool_call_tool_preserves_tool_names_with_dashes() {
         sent[0]["params"]["arguments"],
         serde_json::json!({"query": "dephy"})
     );
+}
+
+#[tokio::test]
+async fn mcp_pool_rejects_unadvertised_tool_without_sending_tools_call() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        // A malicious server could implement this hidden method, but local
+        // catalog authorization must prevent the transport from seeing it.
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": {"deleted": true}
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.name = "spy".to_string();
+    conn.tools = vec![McpTool {
+        name: "read".to_string(),
+        description: None,
+        input_schema: serde_json::json!({}),
+    }];
+    let mut pool = McpPool::new(McpConfig::default());
+    pool.connections.insert("spy".to_string(), conn);
+
+    let error = pool
+        .call_tool("mcp_spy_delete", serde_json::json!({}))
+        .await
+        .expect_err("unadvertised hidden tool must fail locally");
+    assert!(error.to_string().contains("Unknown MCP tool name"));
+    assert!(sent.lock().unwrap().is_empty(), "zero tools/call requests");
+}
+
+#[tokio::test]
+async fn mcp_pool_binds_prompts_and_resources_to_advertised_catalog() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": {"contents": []}
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.name = "catalog".to_string();
+    conn.prompts = vec![McpPrompt {
+        name: "review".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    }];
+    conn.resources = vec![McpResource {
+        uri: "file:///readme".to_string(),
+        name: "readme".to_string(),
+        description: None,
+        mime_type: None,
+    }];
+    conn.resource_templates = vec![McpResourceTemplate {
+        uri_template: "repo://item/{id}".to_string(),
+        name: "item".to_string(),
+        description: None,
+        mime_type: None,
+    }];
+    let mut pool = McpPool::new(McpConfig::default());
+    pool.connections.insert("catalog".to_string(), conn);
+
+    pool.get_prompt("catalog", "hidden", serde_json::json!({}))
+        .await
+        .expect_err("hidden prompt must fail locally");
+    pool.read_resource("catalog", "file:///hidden")
+        .await
+        .expect_err("hidden literal resource must fail locally");
+    assert!(sent.lock().unwrap().is_empty());
+
+    let result = pool
+        .read_resource("catalog", "repo://item/42")
+        .await
+        .expect("exact advertised template expansion is callable");
+    assert_eq!(result, serde_json::json!({"contents": []}));
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["method"], "resources/read");
+    assert_eq!(sent[0]["params"]["uri"], "repo://item/42");
 }
 
 #[tokio::test]
@@ -3458,6 +3548,7 @@ async fn stdio_transport_shutdown_terminates_child() {
         reader: tokio::io::BufReader::new(stdout),
         stderr_tail: StderrTail::new(),
         authority_cancel_watch: None,
+        _reviewed_launch: None,
     };
 
     // shutdown() should send SIGTERM and complete within the grace window.
@@ -3521,6 +3612,7 @@ async fn stdio_transport_recv_error_includes_stderr_tail() {
         reader: tokio::io::BufReader::new(stdout),
         stderr_tail,
         authority_cancel_watch: None,
+        _reviewed_launch: None,
     };
 
     // Give the subprocess time to write its stderr line and exit.

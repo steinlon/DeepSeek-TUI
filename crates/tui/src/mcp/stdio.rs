@@ -23,6 +23,8 @@ pub(super) struct StdioTransport {
     /// process watcher instead of waiting for a later tool call to drop the
     /// transport.
     pub(super) authority_cancel_watch: Option<tokio::task::JoinHandle<()>>,
+    /// Holds reviewed executable/script handles for the process lifetime.
+    pub(super) _reviewed_launch: Option<super::ReviewedStdioLaunch>,
 }
 
 /// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
@@ -71,23 +73,63 @@ impl StdioTransport {
         config: &McpServerConfig,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
-        if let Some(reviewed_plugin) = config.reviewed_plugin.as_ref() {
+        let reviewed_launch = if let Some(reviewed_plugin) = config.reviewed_plugin.as_ref() {
             // This is deliberately the last trust check before constructing
             // and spawning the lazy stdio child. It re-reads only the
             // Codewhale-owned plugin bundle, never user MCP/provider config or
             // credential files, and fails closed on any content/capability
             // drift after pool construction.
-            reviewed_plugin.validate_before_stdio_spawn(server_name)?;
-        }
-        let mut cmd = tokio::process::Command::new(command);
+            Some(reviewed_plugin.prepare_stdio_launch(
+                server_name,
+                command,
+                &config.args,
+                config.cwd.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let mut cmd = reviewed_launch.as_ref().map_or_else(
+            || {
+                let mut command_process = tokio::process::Command::new(command);
+                command_process.args(&config.args);
+                command_process
+            },
+            |launch| {
+                let mut command_process = tokio::process::Command::new(&launch.command);
+                command_process.args(&launch.args);
+                command_process
+            },
+        );
         crate::utils::suppress_tokio_console_window(&mut cmd);
-        cmd.args(&config.args)
-            .stdin(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if let Some(cwd) = &config.cwd {
+        let launch_cwd = reviewed_launch
+            .as_ref()
+            .and_then(|launch| launch.cwd.as_ref())
+            .or(config.cwd.as_ref().filter(|_| reviewed_launch.is_none()));
+        if let Some(cwd) = launch_cwd {
             cmd.current_dir(cwd);
+        }
+        #[cfg(unix)]
+        if let Some(cwd_fd) = reviewed_launch
+            .as_ref()
+            .and_then(|launch| launch.cwd_fd.as_ref())
+        {
+            use std::os::fd::AsRawFd as _;
+            let fd = cwd_fd.as_raw_fd();
+            // SAFETY: the closure calls only async-signal-safe `fchdir` on an
+            // inherited directory descriptor before exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(fd) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
         }
 
         // Expand `${NAME}` placeholders so secret env values can be sourced
@@ -175,6 +217,7 @@ impl StdioTransport {
             reader: tokio::io::BufReader::new(stdout),
             stderr_tail,
             authority_cancel_watch,
+            _reviewed_launch: reviewed_launch,
         })
     }
 }

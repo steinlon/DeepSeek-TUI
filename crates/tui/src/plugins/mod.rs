@@ -3,6 +3,7 @@
 pub mod context;
 pub mod discovery;
 pub mod manifest;
+mod path_identity;
 pub mod registry;
 pub mod types;
 

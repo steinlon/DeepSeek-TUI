@@ -279,7 +279,13 @@ struct ThreadSummary {
 struct SkillEntry {
     name: String,
     description: String,
-    path: PathBuf,
+    /// Native Skill locator. Reviewed plugin paths are deliberately omitted;
+    /// their bodies are available only through the authority-bound snapshot.
+    path: Option<PathBuf>,
+    source: String,
+    plugin_id: Option<String>,
+    plugin_generation: Option<u64>,
+    plugin_content_hash: Option<String>,
     enabled: bool,
     is_bundled: bool,
 }
@@ -1396,18 +1402,52 @@ async fn list_skills(
         );
         (skills_dir, mode)
     };
-    let (registry, directories) =
-        discover_skills_for_runtime_api(&state.workspace, &skills_dir, mode);
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
     let skill_state = state.skill_state.lock().await;
     let skills = registry
         .list()
         .iter()
-        .map(|skill| SkillEntry {
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            path: skill.path.clone(),
-            enabled: skill_state.is_enabled(&skill.name),
-            is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+        .map(|skill| {
+            let (path, source, plugin_id, plugin_generation, plugin_content_hash) =
+                match &skill.source {
+                    crate::skills::SkillSource::Native => (
+                        Some(skill.path.clone()),
+                        "native".to_string(),
+                        None,
+                        None,
+                        None,
+                    ),
+                    crate::skills::SkillSource::Plugin {
+                        plugin_id,
+                        plugin_name,
+                        authority,
+                    } => (
+                        None,
+                        format!("reviewed-plugin-snapshot:{plugin_name}"),
+                        Some(plugin_id.clone()),
+                        Some(authority.state_generation),
+                        Some(authority.content_hash.clone()),
+                    ),
+                };
+            SkillEntry {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                path,
+                source,
+                plugin_id,
+                plugin_generation,
+                plugin_content_hash,
+                enabled: skill_state.is_enabled(&skill.name),
+                is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+            }
         })
         .collect();
     Ok(Json(SkillsResponse {
@@ -1431,8 +1471,15 @@ async fn set_skill_enabled(
         );
         (skills_dir, mode)
     };
-    let (registry, directories) =
-        discover_skills_for_runtime_api(&state.workspace, &skills_dir, mode);
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
     let exists = registry.list().iter().any(|skill| skill.name == name);
     if !exists {
         return Err(ApiError::not_found(format!(
@@ -2833,9 +2880,11 @@ fn discover_skills_for_runtime_api(
     workspace: &FsPath,
     skills_dir: &FsPath,
     mode: crate::skills::SkillDiscoveryMode,
+    plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
     let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry = crate::skills::discover_from_directories(directories.clone());
+    let registry =
+        crate::skills::discover_from_directories_with_plugins(directories.clone(), plugins);
     (registry, directories)
 }
 

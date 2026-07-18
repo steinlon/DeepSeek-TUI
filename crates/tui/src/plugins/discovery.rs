@@ -349,12 +349,47 @@ fn parse_skill_snapshots(
             ));
         }
         for skill in registry.list() {
+            let relative = skill
+                .path
+                .strip_prefix(&validated.canonical_root)
+                .map_err(|_| {
+                    format!(
+                        "plugin `{}` Skill path escaped the reviewed bundle",
+                        validated.manifest.plugin.name
+                    )
+                })?;
+            let expected_hash = validated.file_hashes.get(relative).ok_or_else(|| {
+                format!(
+                    "plugin `{}` Skill was not present in the reviewed byte inventory",
+                    validated.manifest.plugin.name
+                )
+            })?;
+            let bytes = read_skill_bytes(&skill.path)?;
+            let actual_hash = hash_skill_bytes(&bytes);
+            if &actual_hash != expected_hash {
+                return Err(format!(
+                    "plugin `{}` Skill changed between review hashing and parsing",
+                    validated.manifest.plugin.name
+                ));
+            }
+            let content = std::str::from_utf8(&bytes)
+                .map_err(|_| "plugin Skill must be valid UTF-8".to_string())?;
+            let (skill, parse_warnings) =
+                crate::skills::SkillRegistry::parse_verified_content(&skill.path, content)?;
+            for warning in parse_warnings {
+                diagnostics.push(PluginDiagnostic::warning(
+                    "skill-invalid",
+                    warning,
+                    Some(skill.path.clone()),
+                ));
+            }
             skill_snapshots.push(PluginSkillSnapshot {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
                 localized_descriptions: skill.localized_descriptions.clone(),
                 body: skill.body.clone(),
                 path: skill.path.clone(),
+                source_hash: actual_hash,
             });
         }
     }
@@ -376,6 +411,32 @@ fn parse_skill_snapshots(
     Ok((skill_snapshots, diagnostics))
 }
 
+fn read_skill_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let file = super::manifest::open_bundle_file(path)
+        .map_err(|e| format!("failed to open plugin Skill without following links: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read plugin Skill: {e}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("plugin Skill exceeds the one-megabyte parse limit".to_string());
+    }
+    Ok(bytes)
+}
+
+fn hash_skill_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codewhale-plugin-file-bytes-v1\0");
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub(crate) fn load_staged_skill_snapshots(
     staged_root: &Path,
     expected_content_hash: &str,
@@ -394,6 +455,16 @@ pub(crate) fn load_staged_skill_snapshots(
             "staged plugin Skill snapshot is invalid: {}",
             diagnostic.message
         ));
+    }
+    // Parsing is explicitly bound to the first validation's file inventory;
+    // a final whole-bundle pass also rejects additions/removals/config drift
+    // that occurred during directory traversal.
+    let refreshed = PluginManifest::validate_from_path(&staged_root.join(PLUGIN_MANIFEST))?;
+    if refreshed.content_hash != validated.content_hash
+        || refreshed.capability_hash != validated.capability_hash
+        || refreshed.file_hashes != validated.file_hashes
+    {
+        return Err("staged plugin changed while its Skill snapshots were parsed".to_string());
     }
     Ok(snapshots)
 }
@@ -416,10 +487,12 @@ pub(crate) fn load_plugin_for_test(manifest_path: &Path) -> Result<LoadedPlugin,
 
 fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
     let mut hasher = Sha256::new();
-    hasher.update(b"codewhale-plugin-id-v1\0");
+    // v2 intentionally invalidates receipts produced by the former lossy
+    // Unicode path identity.
+    hasher.update(b"codewhale-plugin-id-v2\0");
     hasher.update(scope.as_str().as_bytes());
     hasher.update(b"\0");
-    hasher.update(canonical_root.to_string_lossy().as_bytes());
+    super::path_identity::hash_os_path(&mut hasher, b"canonical-plugin-root", canonical_root);
     let digest = hasher.finalize();
     let suffix = digest[..6]
         .iter()
@@ -506,6 +579,24 @@ mod tests {
         assert_eq!(
             first.get("alpha").unwrap().id,
             second.get("alpha").unwrap().id
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_ids_distinguish_lossy_colliding_native_roots() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let left_name = OsString::from_vec(vec![b'p', 0xff]);
+        let right_name = OsString::from_vec(vec![b'p', 0xfe]);
+        assert_eq!(left_name.to_string_lossy(), right_name.to_string_lossy());
+        let left = tmp.path().join(left_name);
+        let right = tmp.path().join(right_name);
+        assert_ne!(
+            plugin_id(PluginScope::User, "same", &left),
+            plugin_id(PluginScope::User, "same", &right)
         );
     }
 

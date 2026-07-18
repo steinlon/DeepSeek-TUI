@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 mod headers;
 pub mod oauth;
@@ -640,6 +641,58 @@ impl ReviewedPluginMcpSource {
         self.validate_before_use(server_name, "spawn")
     }
 
+    pub(crate) fn prepare_stdio_launch(
+        &self,
+        server_name: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<ReviewedStdioLaunch> {
+        self.validate_before_stdio_spawn(server_name)?;
+        let staged_root = self
+            .authority
+            .staged_manifest
+            .parent()
+            .context("reviewed plugin stage manifest has no parent")?;
+        let validated = crate::plugins::manifest::PluginManifest::validate_from_path(
+            &self.authority.staged_manifest,
+        )
+        .map_err(|_| anyhow::anyhow!("reviewed plugin stage could not be opened for launch"))?;
+        if validated.content_hash != self.authority.content_hash
+            || validated.capability_hash != self.authority.capability_hash
+        {
+            anyhow::bail!("reviewed plugin stage changed before stdio launch");
+        }
+
+        let mut launch = ReviewedStdioLaunch {
+            command: std::ffi::OsString::from(command),
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            cwd: cwd.map(Path::to_path_buf),
+            opened_files: Vec::new(),
+            #[cfg(unix)]
+            cwd_fd: None,
+        };
+        if Path::new(command).is_absolute() {
+            launch.bind_command(staged_root, Path::new(command), &validated.file_hashes)?;
+        }
+        for (index, argument) in args.iter().enumerate() {
+            let path = Path::new(argument);
+            if path.is_absolute() && path.starts_with(staged_root) && path.is_file() {
+                launch.args[index] = launch.bind_file(staged_root, path, &validated.file_hashes)?;
+            }
+        }
+        if let Some(cwd) = cwd {
+            if !cwd.starts_with(staged_root) {
+                anyhow::bail!("reviewed plugin stdio cwd escaped its staged root");
+            }
+            launch.bind_cwd(cwd)?;
+        }
+        // A final authority pass detects any non-executed companion/config
+        // drift while handles were opened. Execution itself uses the handles.
+        self.validate_before_stdio_spawn(server_name)?;
+        Ok(launch)
+    }
+
     fn validate_before_use(&self, server_name: &str, operation: &str) -> Result<()> {
         let remediation = format!(
             "Run `/plugin reload`, inspect `/plugin show {0}`, then repeat the displayed trust command and `/plugin enable {0}` before retrying",
@@ -668,6 +721,190 @@ impl ReviewedPluginMcpSource {
     fn state_is_current(&self) -> bool {
         crate::plugins::registry::verify_plugin_state_authority(&self.authority).is_ok()
     }
+}
+
+pub(crate) struct ReviewedStdioLaunch {
+    pub(crate) command: std::ffi::OsString,
+    pub(crate) args: Vec<std::ffi::OsString>,
+    pub(crate) cwd: Option<PathBuf>,
+    /// Kept for the child lifetime. Windows opens deny write/delete sharing;
+    /// Unix children execute/read inherited descriptors rather than paths.
+    pub(crate) opened_files: Vec<fs::File>,
+    #[cfg(unix)]
+    pub(crate) cwd_fd: Option<fs::File>,
+}
+
+impl ReviewedStdioLaunch {
+    fn bind_command(
+        &mut self,
+        staged_root: &Path,
+        path: &Path,
+        expected_hashes: &std::collections::BTreeMap<PathBuf, String>,
+    ) -> Result<()> {
+        let bound_path = self.bind_file(staged_root, path, expected_hashes)?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.command = bound_path;
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::FileExt as _;
+
+            // Darwin devfs deliberately rejects execve("/dev/fd/N"). Bind
+            // reviewed scripts by running the interpreter declared in their
+            // exact hashed shebang and passing the inherited descriptor as
+            // input. Native Mach-O bundle commands have no fexecve/execveat
+            // equivalent on Darwin, so fail closed and require the manifest
+            // to name a bare interpreter with the bundle file as an argument.
+            let file = self
+                .opened_files
+                .last()
+                .context("reviewed command handle disappeared")?;
+            let mut prefix = [0_u8; 4_096];
+            let read = file
+                .read_at(&mut prefix, 0)
+                .context("read reviewed command shebang")?;
+            let prefix = &prefix[..read];
+            let line_end = prefix
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(prefix.len());
+            let line = std::str::from_utf8(&prefix[..line_end])
+                .context("reviewed script shebang is not UTF-8")?;
+            let shebang = line.strip_prefix("#!").map(str::trim).filter(|s| !s.is_empty())
+                .context(
+                    "Darwin cannot execute a reviewed native bundle command by descriptor; use a shebang script or declare a bare interpreter command plus the script argument",
+                )?;
+            let mut words = shlex::split(shebang)
+                .context("reviewed script shebang could not be parsed safely")?;
+            let interpreter = words
+                .first()
+                .filter(|word| Path::new(word).is_absolute())
+                .context("reviewed script shebang interpreter must be absolute")?
+                .clone();
+            words.remove(0);
+            let mut args = words
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            args.push(bound_path);
+            args.append(&mut self.args);
+            self.command = std::ffi::OsString::from(interpreter);
+            self.args = args;
+            Ok(())
+        }
+    }
+
+    fn bind_file(
+        &mut self,
+        staged_root: &Path,
+        path: &Path,
+        expected_hashes: &std::collections::BTreeMap<PathBuf, String>,
+    ) -> Result<std::ffi::OsString> {
+        let relative = path
+            .strip_prefix(staged_root)
+            .context("reviewed plugin executable escaped its staged root")?;
+        let expected = expected_hashes
+            .get(relative)
+            .context("reviewed plugin executable is absent from its byte inventory")?;
+        let mut file = open_reviewed_launch_file(path)?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"codewhale-plugin-file-bytes-v1\0");
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .context("read reviewed launch file")?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let actual = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if &actual != expected {
+            anyhow::bail!("reviewed plugin executable bytes changed before spawn");
+        }
+        file.seek(std::io::SeekFrom::Start(0))
+            .context("rewind reviewed launch file after verification")?;
+
+        #[cfg(unix)]
+        let launch_path = {
+            use std::os::fd::AsRawFd as _;
+            let fd = file.as_raw_fd();
+            // SAFETY: `fd` is owned by `file`; clearing only FD_CLOEXEC keeps
+            // that same descriptor available across the imminent exec.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+            {
+                anyhow::bail!("failed to inherit reviewed plugin executable descriptor");
+            }
+            #[cfg(target_os = "linux")]
+            let prefix = "/proc/self/fd";
+            #[cfg(not(target_os = "linux"))]
+            let prefix = "/dev/fd";
+            std::ffi::OsString::from(format!("{prefix}/{fd}"))
+        };
+
+        #[cfg(not(unix))]
+        let launch_path = path.as_os_str().to_os_string();
+
+        self.opened_files.push(file);
+        Ok(launch_path)
+    }
+
+    fn bind_cwd(&mut self, cwd: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(cwd)
+                .context("open reviewed plugin cwd without following links")?;
+            self.cwd_fd = Some(file);
+            self.cwd = None;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001) // FILE_SHARE_READ only
+                .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                .open(cwd)
+                .context("open reviewed plugin cwd without write/delete sharing")?;
+            let metadata = file
+                .metadata()
+                .context("inspect reviewed plugin cwd handle")?;
+            if !metadata.is_dir() || metadata.file_attributes() & 0x0000_0400 != 0 {
+                anyhow::bail!("reviewed plugin cwd is a reparse point or non-directory");
+            }
+            self.opened_files.push(file);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_reviewed_launch_file(path: &Path) -> Result<fs::File> {
+    crate::plugins::manifest::open_bundle_file(path)
+        .context("open reviewed launch file without following links")
+}
+
+#[cfg(windows)]
+fn open_reviewed_launch_file(path: &Path) -> Result<fs::File> {
+    crate::plugins::manifest::open_bundle_file(path)
+        .context("open reviewed launch file without links, hard links, or write/delete sharing")
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_reviewed_launch_file(path: &Path) -> Result<fs::File> {
+    fs::File::open(path).context("open reviewed launch file")
 }
 
 fn reviewed_remote_endpoint_identity(endpoint: &str) -> Result<(String, String)> {
@@ -804,6 +1041,50 @@ pub struct McpResourceTemplate {
     pub description: Option<String>,
     #[serde(rename = "mimeType", default)]
     pub mime_type: Option<String>,
+}
+
+/// Fail-closed RFC 6570 subset used only as an authorization check. Literal,
+/// simple (`{id}`), and reserved (`{+path}`) expansions cover the common MCP
+/// resource templates. More elaborate operators remain listable but are not
+/// callable until their expansion semantics are implemented exactly.
+fn resource_uri_matches_template(uri: &str, template: &str) -> bool {
+    let mut pattern = String::from("^");
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        pattern.push_str(&regex::escape(&rest[..start]));
+        let Some(end) = rest[start + 1..].find('}') else {
+            return false;
+        };
+        let expression = &rest[start + 1..start + 1 + end];
+        let (reserved, variables) = match expression.strip_prefix('+') {
+            Some(variables) => (true, variables),
+            None => (false, expression),
+        };
+        if variables.is_empty()
+            || variables.split(',').any(|variable| {
+                variable.is_empty()
+                    || !variable
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+            })
+        {
+            return false;
+        }
+        let atom = if reserved { ".+" } else { "[^/?#]+" };
+        for (index, _) in variables.split(',').enumerate() {
+            if index > 0 {
+                pattern.push(',');
+            }
+            pattern.push_str(atom);
+        }
+        rest = &rest[start + end + 2..];
+    }
+    if rest.contains('}') {
+        return false;
+    }
+    pattern.push_str(&regex::escape(rest));
+    pattern.push('$');
+    regex::Regex::new(&pattern).is_ok_and(|regex| regex.is_match(uri))
 }
 
 /// Prompt discovered from an MCP server
@@ -1387,6 +1668,9 @@ pub struct McpConnection {
     cancel_token: tokio_util::sync::CancellationToken,
     authority_revocation_reason: Arc<std::sync::Mutex<Option<String>>>,
     authority_watch: Option<tokio::task::JoinHandle<()>>,
+    /// Pool catalog generation that created/last authorized this connection.
+    /// Directly constructed test connections use zero until inserted.
+    catalog_generation: u64,
 }
 
 struct PendingAuthorityWatch {
@@ -1698,6 +1982,7 @@ impl McpConnection {
             cancel_token,
             authority_revocation_reason,
             authority_watch,
+            catalog_generation: 0,
         };
 
         // Initialize with timeout
@@ -2308,6 +2593,14 @@ impl Drop for McpConnection {
 
 // === McpPool - Connection Pool Management ===
 
+#[derive(Debug, Clone)]
+struct McpToolRoute {
+    server_name: String,
+    tool_name: String,
+    catalog_generation: u64,
+    plugin_authority: Option<crate::plugins::types::PluginAuthority>,
+}
+
 /// Pool of MCP connections for reuse
 pub struct McpPool {
     connections: HashMap<String, McpConnection>,
@@ -2324,6 +2617,10 @@ pub struct McpPool {
     /// against the freshly-loaded config after an mtime change to skip
     /// reloading when the file was merely touched.
     config_hash: u64,
+    /// Monotonic identity for the exact config/plugin catalog generation that
+    /// advertised a callable MCP item. Resolution captures this value and the
+    /// call boundary rejects any intervening lazy reload or dynamic mutation.
+    catalog_generation: AtomicU64,
     /// Most recently observed mtime for `config_sources`.
     last_mtimes: Vec<Option<std::time::SystemTime>>,
     /// Dynamically added MCP servers (from tool calls at runtime).
@@ -2343,6 +2640,7 @@ impl McpPool {
             workspace: None,
             plugin_registry: None,
             config_hash,
+            catalog_generation: AtomicU64::new(1),
             last_mtimes: Vec::new(),
             dynamic_servers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -2481,6 +2779,7 @@ impl McpPool {
         self.drop_all_connections("config reload");
         self.config = new_config;
         self.config_hash = new_hash;
+        self.catalog_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
 
@@ -2537,13 +2836,14 @@ impl McpPool {
             anyhow::bail!("Failed to connect MCP server '{server_name}': server is disabled");
         }
 
-        let connection = McpConnection::connect_with_policy(
+        let mut connection = McpConnection::connect_with_policy(
             server_name.to_string(),
             server_config,
             &self.config.timeouts,
             self.network_policy.as_ref(),
         )
         .await?;
+        connection.catalog_generation = self.catalog_generation.load(Ordering::SeqCst);
 
         self.connections.insert(server_name.to_string(), connection);
         self.connections
@@ -2778,6 +3078,14 @@ impl McpPool {
     ) -> Result<serde_json::Value> {
         let global_timeouts = self.config.timeouts;
         let conn = self.get_or_connect(server_name).await?;
+        let advertised_literal = conn.resources().iter().any(|resource| resource.uri == uri);
+        let advertised_template = conn
+            .resource_templates()
+            .iter()
+            .any(|template| resource_uri_matches_template(uri, &template.uri_template));
+        if !advertised_literal && !advertised_template {
+            anyhow::bail!("MCP resource URI '{uri}' was not advertised by server '{server_name}'");
+        }
         let timeout = conn.config().effective_read_timeout(&global_timeouts);
         conn.read_resource(uri, timeout).await
     }
@@ -2791,6 +3099,15 @@ impl McpPool {
     ) -> Result<serde_json::Value> {
         let global_timeouts = self.config.timeouts;
         let conn = self.get_or_connect(server_name).await?;
+        if !conn
+            .prompts()
+            .iter()
+            .any(|prompt| prompt.name == prompt_name)
+        {
+            anyhow::bail!(
+                "MCP prompt '{prompt_name}' was not advertised by server '{server_name}'"
+            );
+        }
         let timeout = conn.config().effective_execute_timeout(&global_timeouts);
         conn.get_prompt(prompt_name, arguments, timeout).await
     }
@@ -2824,38 +3141,67 @@ impl McpPool {
             return Ok(matched);
         }
 
-        // Preserve lazy connection for a uniquely named configured server.
-        // Never use the former "longest prefix wins" heuristic: two server
-        // names can encode the same model-visible name and silently redirect
-        // authority (for example `my` + `db_read` vs `my_db` + `read`).
-        let dynamic_servers = self.dynamic_servers.read();
-        let configured_servers = self
-            .config
-            .servers
-            .iter()
-            .filter_map(|(name, config)| config.is_enabled().then_some(name.as_str()))
-            .chain(
-                dynamic_servers
-                    .iter()
-                    .filter_map(|(name, config)| config.is_enabled().then_some(name.as_str())),
-            );
-        let mut configured_match: Option<(String, String)> = None;
-        for server in configured_servers {
-            let Some(tool) = rest
-                .strip_prefix(server)
-                .and_then(|suffix| suffix.strip_prefix('_'))
-                .filter(|tool| !tool.is_empty())
-            else {
-                continue;
-            };
-            if configured_match.is_some() {
-                anyhow::bail!(
-                    "Ambiguous MCP tool name '{prefixed_name}' matches more than one configured server authority"
-                );
-            }
-            configured_match = Some((server.to_string(), tool.to_string()));
+        Err(anyhow::anyhow!("Unknown MCP tool name: {prefixed_name}"))
+    }
+
+    /// Resolve an MCP tool through an exact advertised catalog. A configured
+    /// but lazy server may be connected and asked for `tools/list`; the
+    /// requested suffix is never treated as authority on its own.
+    async fn resolve_advertised_tool(&mut self, prefixed_name: &str) -> Result<McpToolRoute> {
+        if let Ok((server_name, tool_name)) = self.parse_prefixed_name(prefixed_name) {
+            return self.capture_tool_route(server_name, tool_name);
         }
-        configured_match.ok_or_else(|| anyhow::anyhow!("Unknown MCP tool name: {prefixed_name}"))
+        let Some(rest) = prefixed_name.strip_prefix("mcp_") else {
+            anyhow::bail!("Invalid MCP tool name: {prefixed_name}");
+        };
+        let mut candidates = {
+            let dynamic = self.dynamic_servers.read();
+            self.config
+                .servers
+                .iter()
+                .filter_map(|(name, config)| {
+                    (config.is_enabled()
+                        && rest
+                            .strip_prefix(name)
+                            .is_some_and(|suffix| suffix.starts_with('_')))
+                    .then_some(name.clone())
+                })
+                .chain(dynamic.iter().filter_map(|(name, config)| {
+                    (config.is_enabled()
+                        && rest
+                            .strip_prefix(name)
+                            .is_some_and(|suffix| suffix.starts_with('_')))
+                    .then_some(name.clone())
+                }))
+                .collect::<Vec<_>>()
+        };
+        candidates.sort();
+        candidates.dedup();
+        for server in candidates {
+            // Connecting and catalog discovery are the only lazy side effects.
+            // A guessed method is never sent to the transport.
+            let _ = self.get_or_connect(&server).await?;
+        }
+        let (server_name, tool_name) = self.parse_prefixed_name(prefixed_name)?;
+        self.capture_tool_route(server_name, tool_name)
+    }
+
+    fn capture_tool_route(&self, server_name: String, tool_name: String) -> Result<McpToolRoute> {
+        let connection = self
+            .connections
+            .get(&server_name)
+            .context("advertised MCP connection disappeared during resolution")?;
+        let plugin_authority = connection
+            .config()
+            .reviewed_plugin
+            .as_ref()
+            .map(|source| source.authority.clone());
+        Ok(McpToolRoute {
+            server_name,
+            tool_name,
+            catalog_generation: connection.catalog_generation,
+            plugin_authority,
+        })
     }
 
     /// Convert discovered tools to API Tool format
@@ -3059,11 +3405,24 @@ impl McpPool {
             return self.get_prompt(server_name, name, args).await;
         }
 
-        let (server_name, tool_name) = self.parse_prefixed_name(prefixed_name)?;
+        let route = self.resolve_advertised_tool(prefixed_name).await?;
+        let server_name = route.server_name.clone();
+        let tool_name = route.tool_name.clone();
         // Copy the global timeouts to avoid borrow conflict
         let global_timeouts = self.config.timeouts;
         let conn = self.get_or_connect(&server_name).await?;
-        if !conn.config().is_tool_enabled(&tool_name) {
+        if conn.catalog_generation != route.catalog_generation {
+            anyhow::bail!("MCP catalog changed after tool resolution; retry the call");
+        }
+        if conn
+            .config()
+            .reviewed_plugin
+            .as_ref()
+            .map(|source| &source.authority)
+            != route.plugin_authority.as_ref()
+            || !conn.config().is_tool_enabled(&tool_name)
+            || !conn.tools().iter().any(|tool| tool.name == tool_name)
+        {
             anyhow::bail!("MCP tool '{tool_name}' is disabled for server '{server_name}'");
         }
         let timeout = conn.config().effective_execute_timeout(&global_timeouts);
@@ -3079,7 +3438,16 @@ impl McpPool {
                 );
                 self.drop_connection(&server_name, "stale session retry");
                 let conn = self.get_or_connect(&server_name).await?;
-                if !conn.config().is_tool_enabled(&tool_name) {
+                if conn.catalog_generation != route.catalog_generation
+                    || conn
+                        .config()
+                        .reviewed_plugin
+                        .as_ref()
+                        .map(|source| &source.authority)
+                        != route.plugin_authority.as_ref()
+                    || !conn.config().is_tool_enabled(&tool_name)
+                    || !conn.tools().iter().any(|tool| tool.name == tool_name)
+                {
                     anyhow::bail!("MCP tool '{tool_name}' is disabled for server '{server_name}'");
                 }
                 let timeout = conn.config().effective_execute_timeout(&global_timeouts);
@@ -3130,6 +3498,7 @@ impl McpPool {
             ));
         }
         dynamic.insert(name, config);
+        self.catalog_generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 

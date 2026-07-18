@@ -3376,6 +3376,7 @@ impl App {
             crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
             Some(plugins),
         )
+        .into_enabled()
         .list()
         .iter()
         .map(|s| (s.name.clone(), s.description.clone()))
@@ -3384,12 +3385,14 @@ impl App {
 
     pub fn refresh_skill_cache(&mut self) {
         let skills_dir = self.skills_dir.clone();
-        self.cached_skills = Self::discover_cached_skills(
+        let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
             self.skills_scan_codewhale_only,
             self.plugin_registry.as_ref(),
         );
+        self.hotbar_actions.replace_skills(&cached_skills);
+        self.cached_skills = cached_skills;
     }
 
     pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {

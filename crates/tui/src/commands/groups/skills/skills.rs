@@ -27,30 +27,33 @@ fn discover_visible_skills(app: &App) -> SkillRegistry {
         crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only),
         Some(app.plugin_registry.as_ref()),
     )
+    .into_enabled()
 }
 
 #[cfg(test)]
 fn discover_visible_skills(app: &App) -> SkillRegistry {
     let mode =
         crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only);
-    TEST_HOME_DIR.with(|home| {
-        if let Some(home) = home.borrow().as_deref() {
-            crate::skills::discover_for_workspace_and_dir_with_home_and_mode_and_plugins(
-                &app.workspace,
-                &app.skills_dir,
-                Some(home),
-                mode,
-                Some(app.plugin_registry.as_ref()),
-            )
-        } else {
-            crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
-                &app.workspace,
-                &app.skills_dir,
-                mode,
-                Some(app.plugin_registry.as_ref()),
-            )
-        }
-    })
+    TEST_HOME_DIR
+        .with(|home| {
+            if let Some(home) = home.borrow().as_deref() {
+                crate::skills::discover_for_workspace_and_dir_with_home_and_mode_and_plugins(
+                    &app.workspace,
+                    &app.skills_dir,
+                    Some(home),
+                    mode,
+                    Some(app.plugin_registry.as_ref()),
+                )
+            } else {
+                crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
+                    &app.workspace,
+                    &app.skills_dir,
+                    mode,
+                    Some(app.plugin_registry.as_ref()),
+                )
+            }
+        })
+        .into_enabled()
 }
 
 fn render_skill_warnings(registry: &SkillRegistry) -> String {

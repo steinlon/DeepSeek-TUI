@@ -234,6 +234,10 @@ pub struct ValidatedManifest {
     pub components: ResolvedPluginComponents,
     pub inventory: PluginInventory,
     pub content_hash: String,
+    /// Digest of the exact bytes read for every regular bundle file, keyed by
+    /// its lossless relative OS path. Runtime adapters use this to bind parsed
+    /// representations to the same bytes that produced `content_hash`.
+    pub(crate) file_hashes: BTreeMap<PathBuf, String>,
     pub capability_hash: String,
     pub applicable: bool,
     pub warnings: Vec<String>,
@@ -243,7 +247,7 @@ impl PluginManifest {
     pub fn from_path(path: &Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(path)
             .map_err(|e| format!("failed to inspect plugin.toml: {e}"))?;
-        if metadata.file_type().is_symlink() {
+        if metadata_is_link_or_reparse(&metadata) {
             return Err("plugin.toml may not be a symbolic link".to_string());
         }
         let bytes = read_manifest_bytes(path)?;
@@ -256,7 +260,7 @@ impl PluginManifest {
     pub fn validate_from_path(path: &Path) -> Result<ValidatedManifest, String> {
         let manifest_metadata = fs::symlink_metadata(path)
             .map_err(|e| format!("failed to inspect plugin.toml: {e}"))?;
-        if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        if metadata_is_link_or_reparse(&manifest_metadata) || !manifest_metadata.is_file() {
             return Err("plugin.toml must be a regular file, not a symbolic link".to_string());
         }
         let root = path
@@ -264,7 +268,7 @@ impl PluginManifest {
             .ok_or_else(|| "plugin.toml has no parent directory".to_string())?;
         let root_metadata = fs::symlink_metadata(root)
             .map_err(|e| format!("failed to inspect plugin root: {e}"))?;
-        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        if metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
             return Err("plugin root must be a directory, not a symbolic link".to_string());
         }
         let canonical_root = root
@@ -300,7 +304,7 @@ impl PluginManifest {
         let components = manifest.resolve_components(&canonical_root)?;
         manifest.validate_mcp_servers(&canonical_root)?;
         let inventory = manifest.inventory(&components)?;
-        let content_hash = hash_bundle(&canonical_root, &manifest_bytes)?;
+        let (content_hash, file_hashes) = hash_bundle(&canonical_root, &manifest_bytes)?;
         let capability_hash = hash_inventory(&inventory);
         let applicable = manifest.check_when();
         if read_manifest_bytes(path)? != manifest_bytes {
@@ -315,6 +319,7 @@ impl PluginManifest {
             components,
             inventory,
             content_hash,
+            file_hashes,
             capability_hash,
             applicable,
             warnings,
@@ -1090,7 +1095,7 @@ fn reject_symlink_components(root: &Path, target: &Path, kind: &str) -> Result<(
         cursor.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&cursor)
             .map_err(|e| format!("failed to inspect {kind} path {}: {e}", cursor.display()))?;
-        if metadata.file_type().is_symlink() {
+        if metadata_is_link_or_reparse(&metadata) {
             return Err(format!(
                 "{kind} path may not traverse symbolic link {}",
                 cursor.display()
@@ -1110,7 +1115,10 @@ fn looks_windows_absolute(raw: &str) -> bool {
             && matches!(bytes[2], b'\\' | b'/'))
 }
 
-fn hash_bundle(root: &Path, manifest_bytes: &[u8]) -> Result<String, String> {
+fn hash_bundle(
+    root: &Path,
+    manifest_bytes: &[u8],
+) -> Result<(String, BTreeMap<PathBuf, String>), String> {
     let mut hasher = Sha256::new();
     hasher.update(b"codewhale-plugin-content-v1\0plugin.toml\0");
     hasher.update(manifest_bytes);
@@ -1119,13 +1127,14 @@ fn hash_bundle(root: &Path, manifest_bytes: &[u8]) -> Result<String, String> {
     // entrypoints and companion assets are security-relevant even when they do
     // not have a separate component table.
     hash_path(root, root, &mut hasher, &mut budget)?;
-    Ok(hex_digest(hasher.finalize()))
+    Ok((hex_digest(hasher.finalize()), budget.file_hashes))
 }
 
 #[derive(Default)]
 struct HashBudget {
     files: usize,
     bytes: u64,
+    file_hashes: BTreeMap<PathBuf, String>,
 }
 
 fn hash_path(
@@ -1136,7 +1145,7 @@ fn hash_path(
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| format!("failed to inspect component {}: {e}", path.display()))?;
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_or_reparse(&metadata) {
         return Err(format!(
             "component trees may not contain symbolic link {}",
             path.display()
@@ -1145,12 +1154,20 @@ fn hash_path(
     let relative = path
         .strip_prefix(root)
         .map_err(|_| format!("component {} is outside the plugin root", path.display()))?;
-    let relative = relative.to_string_lossy();
     hash_permissions(&metadata, hasher);
     if metadata.is_dir() {
+        #[cfg(windows)]
+        let directory_guard = open_bundle_directory(path)
+            .map_err(|e| format!("failed to open component directory safely: {e}"))?;
+        #[cfg(windows)]
+        ensure_windows_metadata_identity(
+            &metadata,
+            &directory_guard
+                .metadata()
+                .map_err(|e| format!("failed to inspect opened component directory: {e}"))?,
+        )?;
         hasher.update(b"D\0");
-        hasher.update(relative.as_bytes());
-        hasher.update(b"\0");
+        super::path_identity::hash_os_path(hasher, b"bundle-relative-directory", relative);
         let mut entries = fs::read_dir(path)
             .map_err(|e| format!("failed to read component directory {}: {e}", path.display()))?
             .collect::<Result<Vec<_>, _>>()
@@ -1159,6 +1176,8 @@ fn hash_path(
         for entry in entries {
             hash_path(root, &entry.path(), hasher, budget)?;
         }
+        #[cfg(windows)]
+        ensure_windows_path_still_opened(path, &directory_guard)?;
     } else if metadata.is_file() {
         budget.files += 1;
         if budget.files > MAX_HASHED_FILES {
@@ -1167,10 +1186,18 @@ fn hash_path(
             ));
         }
         hasher.update(b"F\0");
-        hasher.update(relative.as_bytes());
-        hasher.update(b"\0");
+        super::path_identity::hash_os_path(hasher, b"bundle-relative-file", relative);
         let mut file = open_bundle_file(path)
             .map_err(|e| format!("failed to read component file {}: {e}", path.display()))?;
+        #[cfg(windows)]
+        ensure_windows_metadata_identity(
+            &metadata,
+            &file
+                .metadata()
+                .map_err(|e| format!("failed to inspect opened component file: {e}"))?,
+        )?;
+        let mut file_hasher = Sha256::new();
+        file_hasher.update(b"codewhale-plugin-file-bytes-v1\0");
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let read = file
@@ -1186,8 +1213,14 @@ fn hash_path(
                 ));
             }
             hasher.update(&buffer[..read]);
+            file_hasher.update(&buffer[..read]);
         }
         hasher.update(b"\0");
+        budget
+            .file_hashes
+            .insert(relative.to_path_buf(), hex_digest(file_hasher.finalize()));
+        #[cfg(windows)]
+        ensure_windows_path_still_opened(path, &file)?;
     } else {
         return Err(format!(
             "component {} is neither a regular file nor directory",
@@ -1228,9 +1261,93 @@ pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001) // deny concurrent writes and replacement
+        .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.number_of_links() != Some(1)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin file is a reparse point, hard link, or non-regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
     fs::File::open(path)
+}
+
+#[cfg(windows)]
+fn open_bundle_directory(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin directory is a reparse point or non-directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn ensure_windows_metadata_identity(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let before_id = (before.volume_serial_number(), before.file_index());
+    let opened_id = (opened.volume_serial_number(), opened.file_index());
+    if before_id.0.is_none() || before_id.1.is_none() || before_id != opened_id {
+        return Err(
+            "plugin path identity changed between metadata inspection and handle open".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_path_still_opened(path: &Path, opened: &fs::File) -> Result<(), String> {
+    let after = fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to re-inspect plugin path after handle open: {e}"))?;
+    let opened = opened
+        .metadata()
+        .map_err(|e| format!("failed to inspect retained plugin handle: {e}"))?;
+    if metadata_is_link_or_reparse(&after) {
+        return Err("plugin path changed into a reparse point during validation".to_string());
+    }
+    ensure_windows_metadata_identity(&after, &opened)
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn hash_inventory(inventory: &PluginInventory) -> String {
@@ -1328,6 +1445,30 @@ mod tests {
         let changed = PluginManifest::validate_from_path(&right_manifest).unwrap();
         assert_ne!(right_hash.content_hash, changed.content_hash);
         assert_eq!(right_hash.capability_hash, changed.capability_hash);
+    }
+
+    // Darwin rejects these malformed bytes at the filesystem boundary. The
+    // platform-independent native-path framing is covered in path_identity;
+    // run this full bundle-walk regression where Unix permits the entries.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn bundle_hash_distinguishes_lossy_colliding_native_file_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let left_manifest = write_manifest(left.path(), "");
+        let right_manifest = write_manifest(right.path(), "");
+        let left_name = OsString::from_vec(vec![b'a', 0xff]);
+        let right_name = OsString::from_vec(vec![b'a', 0xfe]);
+        assert_eq!(left_name.to_string_lossy(), right_name.to_string_lossy());
+        fs::write(left.path().join(left_name), "same bytes").unwrap();
+        fs::write(right.path().join(right_name), "same bytes").unwrap();
+
+        let left = PluginManifest::validate_from_path(&left_manifest).unwrap();
+        let right = PluginManifest::validate_from_path(&right_manifest).unwrap();
+        assert_ne!(left.content_hash, right.content_hash);
     }
 
     #[test]
