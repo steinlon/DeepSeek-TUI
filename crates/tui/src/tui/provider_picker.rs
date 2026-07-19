@@ -55,9 +55,7 @@ use crate::tui::views::{
 };
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
 use codewhale_config::provider::WireFormat;
-use codewhale_config::route::{
-    LogicalModelRef, PricingSku, RequestProtocol, RouteRequest, RouteResolver,
-};
+use codewhale_config::route::{PricingSku, RequestProtocol};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -266,6 +264,8 @@ impl ProviderModelOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCapabilityBadges {
     pub context_window: Option<u32>,
+    /// Source receipt for the route-effective context-window badge.
+    pub context_window_source: Option<String>,
     pub max_output: Option<u32>,
     pub tools: SupportState,
     pub structured: SupportState,
@@ -278,6 +278,7 @@ impl ProviderCapabilityBadges {
         let cap = resolved_capability_profile(provider, wire_model);
         Self {
             context_window: cap.context_window,
+            context_window_source: None,
             max_output: cap.max_output,
             tools: cap.native_tool_calls,
             structured: cap.structured_output,
@@ -289,6 +290,7 @@ impl ProviderCapabilityBadges {
     fn unknown() -> Self {
         Self {
             context_window: None,
+            context_window_source: None,
             max_output: None,
             tools: SupportState::Unknown,
             structured: SupportState::Unknown,
@@ -301,8 +303,9 @@ impl ProviderCapabilityBadges {
     /// render `?` when unknown rather than being silently dropped.
     fn label(&self) -> String {
         format!(
-            "ctx:{} out:{} tools:{} json:{} stream:{} cache:{}",
+            "ctx:{}({}) out:{} tools:{} json:{} stream:{} cache:{}",
             humanize_token_count(self.context_window),
+            self.context_window_source.as_deref().unwrap_or("?"),
             humanize_token_count(self.max_output),
             support_glyph(self.tools),
             support_glyph(self.structured),
@@ -529,23 +532,35 @@ impl ProviderDashboardRow {
         } else {
             ProviderCatalogStatus::Bundled
         };
-        let route_request = RouteRequest {
-            explicit_provider: Some(kind),
-            model_selector: configured_model.clone().map(LogicalModelRef::from),
-            saved_provider_model: None,
+        let mut messages = Vec::new();
+        // Use the same route-effective resolver as the active runtime. In
+        // particular, Kimi Code's bare K3 model has a conservative 262K
+        // membership-plan baseline (or an explicit configured override), not
+        // the generic catalog's unknown-model fallback.
+        let route = crate::route_runtime::resolve_route_candidate_with_context_metadata(
+            provider,
+            configured_model.as_deref(),
+            None,
             // The legacy CN alias shares DeepSeek's strict model contract.
             // Passing its endpoint as a generic override would classify the
             // route as custom and accidentally accept foreign model ids.
-            base_url_override: (provider != ApiProvider::DeepseekCN)
+            (provider != ApiProvider::DeepseekCN)
                 .then(|| configured_base_url.clone())
                 .flatten(),
-        };
-
-        let mut messages = Vec::new();
-        let route = RouteResolver::new().resolve(&route_request);
-        let (base_url, supported_protocols, default_route, resolved_pricing, route_ok) = match route
-        {
-            Ok(candidate) => {
+            config.context_window_for_provider_config(provider),
+            None,
+        );
+        let (
+            base_url,
+            supported_protocols,
+            default_route,
+            resolved_pricing,
+            route_ok,
+            route_context_window,
+            route_context_window_source,
+        ) = match route {
+            Ok(resolution) => {
+                let candidate = resolution.candidate;
                 if !candidate.validation.messages.is_empty() {
                     messages.extend(candidate.validation.messages.clone());
                 }
@@ -564,6 +579,8 @@ impl ProviderDashboardRow {
                     },
                     pricing_label(provider, candidate.pricing.as_ref()),
                     candidate.validation.ok,
+                    Some(resolution.context_window.tokens),
+                    Some(resolution.context_window.source.label().to_string()),
                 )
             }
             Err(error) => {
@@ -584,6 +601,8 @@ impl ProviderDashboardRow {
                     },
                     usage_meter.clone(),
                     false,
+                    None,
+                    None,
                 )
             }
         };
@@ -614,8 +633,14 @@ impl ProviderDashboardRow {
             route_ok,
             &ProviderReadinessSnapshot::default(),
         );
-        let reasoning = ProviderReasoningSummary::for_route(provider, &default_route, config);
-        let capabilities = ProviderCapabilityBadges::for_route(provider, &default_route.wire_model);
+        let reasoning =
+            ProviderReasoningSummary::for_route(provider, &base_url, &default_route, config);
+        let mut capabilities =
+            ProviderCapabilityBadges::for_route(provider, &default_route.wire_model);
+        if let Some(context_window) = route_context_window {
+            capabilities.context_window = Some(context_window);
+        }
+        capabilities.context_window_source = route_context_window_source;
         let external_credential_status = config.external_credential_consent_status(provider);
 
         Self {
@@ -776,12 +801,34 @@ impl ProviderRequestConcurrencySummary {
 }
 
 impl ProviderReasoningSummary {
-    fn for_route(provider: ApiProvider, route: &ProviderDefaultRoute, config: &Config) -> Self {
+    fn for_route(
+        provider: ApiProvider,
+        base_url: &str,
+        route: &ProviderDefaultRoute,
+        config: &Config,
+    ) -> Self {
         if provider == ApiProvider::OpenaiCodex {
             return Self {
                 support: ProviderReasoningSupport::Supported,
                 controls: codex_reasoning_controls(),
                 stream_visibility: ProviderReasoningStreamVisibility::StructuredThinking,
+                selected_control: selected_reasoning_control(provider, config),
+            };
+        }
+
+        // The bare `k3` ID is deliberately not listed as a generic Moonshot
+        // model. Kimi Code owns this reasoning contract only at its exact
+        // membership-plan endpoint, so surface the capability before key
+        // entry without attributing it to neighboring Moonshot routes.
+        if crate::config::is_exact_kimi_code_k3_route(provider, base_url, &route.wire_model) {
+            return Self {
+                support: ProviderReasoningSupport::Supported,
+                controls: vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                stream_visibility: configured_or_default_stream_visibility(
+                    provider,
+                    config,
+                    ProviderReasoningSupport::Supported,
+                ),
                 selected_control: selected_reasoning_control(provider, config),
             };
         }
@@ -3849,6 +3896,79 @@ mod tests {
         assert_eq!(row.reasoning.selected_control.as_deref(), Some("max"));
         assert!(row.compact_hint().contains("reasoning:high/max"));
         assert!(row.compact_hint().contains("stream:structured"));
+    }
+
+    #[test]
+    fn provider_dashboard_row_surfaces_kimi_code_k3_reasoning_only_on_exact_route() {
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("kimi-code-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::Moonshot,
+            ApiProvider::Moonshot,
+            &config,
+        );
+
+        assert_eq!(
+            row.default_route.wire_model,
+            crate::config::KIMI_CODE_K3_MODEL
+        );
+        assert_eq!(row.reasoning.support, ProviderReasoningSupport::Supported);
+        assert_eq!(
+            row.reasoning.stream_visibility,
+            ProviderReasoningStreamVisibility::StructuredThinking
+        );
+        assert_eq!(
+            row.reasoning.controls,
+            vec!["low".to_string(), "high".to_string(), "max".to_string()]
+        );
+        assert_eq!(
+            row.capabilities.context_window,
+            Some(262_144),
+            "the picker must show the route-effective K3 baseline, not the generic fallback"
+        );
+        assert_eq!(
+            row.capabilities.context_window_source.as_deref(),
+            Some("static Kimi Code safe floor"),
+            "the picker must name the provenance instead of presenting a bare limit as provider fact"
+        );
+        assert!(
+            row.compact_hint()
+                .contains("ctx:262K(static Kimi Code safe floor)"),
+            "the compact picker receipt must retain context provenance"
+        );
+
+        let mut direct = config.clone();
+        direct
+            .providers
+            .as_mut()
+            .expect("providers")
+            .moonshot
+            .base_url = Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string());
+        let direct_row = ProviderDashboardRow::from_config(
+            ApiProvider::Moonshot,
+            ApiProvider::Moonshot,
+            &direct,
+        );
+        assert_ne!(
+            direct_row.reasoning.support,
+            ProviderReasoningSupport::Supported,
+            "generic Moonshot k3 must not inherit Kimi Code's route-owned capability"
+        );
+        assert_ne!(direct_row.capabilities.context_window, Some(262_144));
+        assert_ne!(
+            direct_row.capabilities.context_window_source.as_deref(),
+            Some("static Kimi Code safe floor")
+        );
     }
 
     #[test]

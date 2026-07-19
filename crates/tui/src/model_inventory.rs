@@ -87,7 +87,24 @@ impl ModelInventory {
             for model in models {
                 let readiness =
                     crate::provider_readiness::resolve_for_model(config, provider, &model, health);
-                let capability = provider_capability(provider, &model);
+                let mut capability = provider_capability(provider, &model);
+                if let Ok(route) =
+                    crate::route_runtime::resolve_runtime_route(config, provider, Some(&model))
+                {
+                    if let Some(context_window) = route.candidate.limits.context_tokens {
+                        capability.context_window = context_window.min(u64::from(u32::MAX)) as u32;
+                    }
+                    // Do not promote bare `k3` into the global capability
+                    // catalog. Its thinking trace contract belongs only to
+                    // Kimi Code's exact membership-plan route.
+                    if crate::config::is_exact_kimi_code_k3_route(
+                        provider,
+                        &route.candidate.endpoint.base_url,
+                        route.candidate.wire_model_id.as_str(),
+                    ) {
+                        capability.thinking_supported = true;
+                    }
+                }
                 let mut tags = Vec::new();
                 if capability.context_window >= 1_000_000 {
                     tags.push("long_context");
@@ -446,6 +463,33 @@ mod tests {
             std::fs::read_to_string(credential_path).expect("Kimi file remains untouched"),
             credential_raw
         );
+    }
+
+    #[test]
+    fn inventory_uses_kimi_code_k3_route_context_not_generic_fallback() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("test-kimi-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        let candidate = inventory
+            .candidate(ApiProvider::Moonshot, crate::config::KIMI_CODE_K3_MODEL)
+            .expect("configured Kimi Code K3 route");
+
+        assert_eq!(candidate.context_window, 262_144);
+        assert!(candidate.thinking_supported);
+        assert!(candidate.tags.contains(&"thinking"));
+        assert!(!candidate.tags.contains(&"long_context"));
     }
 
     #[test]

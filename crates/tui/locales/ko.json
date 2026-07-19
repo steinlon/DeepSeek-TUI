@@ -308,6 +308,7 @@
     "LinksTitle": "프로바이더 링크:",
     "LinksDashboard": "대시보드:",
     "LinksDocs": "문서:",
+    "LinksKimiCodeRouteNote": "Kimi Code 멤버십 플랜 경로: `{route}` (플랜 콘솔: `{console}`; 모델 k3 사용). Codewhale은 Kimi CLI 자격 증명을 절대 가져오지 않습니다.",
     "LinksTip": "팁: 프로바이더에 표시된 환경 변수를 사용하거나, `codewhale auth set --provider <id>`로 키를 저장하세요.",
     "SubagentsFetching": "플릿 상태를 가져오는 중...",
     "HelpUnknownCommand": "알 수 없는 명령어: {topic}",

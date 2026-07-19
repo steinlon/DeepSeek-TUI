@@ -25,6 +25,19 @@ pub(crate) enum ContextWindowSource {
     Fallback,
 }
 
+impl ContextWindowSource {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::ProviderReported => "provider-reported",
+            Self::StaticKimiCodeSafeFloor => "static Kimi Code safe floor",
+            Self::Catalog => "catalog",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// Context window carried alongside an exact runtime route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct ContextWindowResolution {

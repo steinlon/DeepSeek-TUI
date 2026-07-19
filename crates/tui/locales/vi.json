@@ -308,6 +308,7 @@
     "LinksTitle": "Liên kết nhà cung cấp:",
     "LinksDashboard": "Bảng điều khiển:",
     "LinksDocs": "Tài liệu:",
+    "LinksKimiCodeRouteNote": "Tuyến gói thành viên Kimi Code: `{route}` (bảng điều khiển gói: `{console}`; dùng mô hình k3). Codewhale không bao giờ nhập thông tin xác thực Kimi CLI.",
     "LinksTip": "Mẹo: Dùng biến môi trường được hiển thị cho nhà cung cấp, hoặc lưu khóa bằng `codewhale auth set --provider <id>`.",
     "SubagentsFetching": "Đang lấy trạng thái Fleet worker...",
     "HelpUnknownCommand": "Lệnh không xác định: {topic}",

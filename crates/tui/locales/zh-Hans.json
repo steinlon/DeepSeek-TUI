@@ -308,6 +308,7 @@
     "LinksTitle": "服务商链接：",
     "LinksDashboard": "控制台：",
     "LinksDocs": "文档：",
+    "LinksKimiCodeRouteNote": "Kimi Code 会员套餐路由：`{route}`（套餐控制台：`{console}`；使用模型 k3）。Codewhale 绝不会导入 Kimi CLI 凭据。",
     "LinksTip": "提示：使用所显示服务商的环境变量，或通过 `codewhale auth set --provider <id>` 保存密钥。",
     "SubagentsFetching": "正在获取 Fleet 工作器状态...",
     "HelpUnknownCommand": "未知命令：{topic}",

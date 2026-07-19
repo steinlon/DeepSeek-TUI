@@ -4,11 +4,11 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, COMMON_DEEPSEEK_MODELS, normalize_custom_model_id,
+    ApiProvider, COMMON_DEEPSEEK_MODELS, DEFAULT_KIMI_CODE_BASE_URL,
+    KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL, normalize_custom_model_id,
     normalize_model_name_for_provider,
 };
 use crate::localization::{Locale, MessageId, tr};
-use crate::route_runtime::resolve_route_candidate;
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
 
@@ -193,27 +193,51 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.api_provider,
                 ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
             );
-        let route_limits = if strict_direct_custom_endpoint {
+        let route_resolution = if strict_direct_custom_endpoint {
             None
         } else {
-            match resolve_route_candidate(
+            // `/model` normally resolves against the active provider's
+            // catalog-default endpoint so it retains the existing local
+            // provider/model validation. The one endpoint-sensitive model
+            // selection is Kimi Code's bare `k3`: resolve it against the
+            // committed Kimi Code route rather than silently falling back to
+            // Moonshot's direct API route. Do not pass an unrelated stale
+            // endpoint through here; doing so would turn a foreign provider
+            // model into an apparent custom-route selection.
+            let route_base_url = crate::config::is_exact_kimi_code_k3_route(
+                app.api_provider,
+                &app.active_route_base_url,
+                &model_id,
+            )
+            .then(|| app.active_route_base_url.clone());
+            match crate::route_runtime::resolve_route_candidate_with_context_metadata(
                 app.api_provider,
                 Some(&model_id),
                 None,
-                None,
+                route_base_url,
                 app.active_context_window_override,
+                None,
             ) {
-                Ok(candidate) => Some(candidate.limits),
+                Ok(resolution) => Some(resolution),
                 Err(reason) => return CommandResult::error(reason),
             }
         };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
         app.set_model_selection(model_id.clone());
-        if let Some(limits) = route_limits {
-            app.set_active_route_limits(limits);
+        if let Some(resolution) = route_resolution {
+            app.set_active_route_resolution(
+                resolution.candidate.endpoint.base_url,
+                resolution.candidate.limits,
+                resolution.context_window.source,
+            );
         } else {
             app.active_route_limits = app.context_window_override_limits();
+            app.active_context_window_source = if app.active_context_window_override.is_some() {
+                crate::route_runtime::ContextWindowSource::Configured
+            } else {
+                crate::route_runtime::ContextWindowSource::Fallback
+            };
         }
         app.update_model_compaction_budget();
         if model_changed {
@@ -413,6 +437,15 @@ pub fn codewhale_links(app: &mut App) -> CommandResult {
                 "{}      `{}`",
                 tr(locale, MessageId::LinksDocs),
                 docs_url
+            );
+        }
+        if provider.kind() == codewhale_config::ProviderKind::Moonshot {
+            let _ = writeln!(
+                message,
+                "{}",
+                tr(locale, MessageId::LinksKimiCodeRouteNote)
+                    .replace("{route}", DEFAULT_KIMI_CODE_BASE_URL)
+                    .replace("{console}", KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
             );
         }
         let env_vars = provider.env_vars();
@@ -939,6 +972,43 @@ mod tests {
     }
 
     #[test]
+    fn model_command_preserves_active_kimi_code_endpoint_for_bare_k3() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.set_provider_identity(crate::config::ApiProvider::Moonshot, "moonshot");
+        app.model_ids_passthrough = true;
+        app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+        app.active_context_window_override = None;
+
+        let result = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+
+        assert!(
+            !result.is_error,
+            "Kimi Code K3 route should resolve: {result:?}"
+        );
+        assert_eq!(app.model, crate::config::KIMI_CODE_K3_MODEL);
+        assert_eq!(
+            app.active_route_limits
+                .and_then(|limits| limits.context_tokens),
+            Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
+        );
+
+        // The same bare model ID on Moonshot's direct API must retain the
+        // generic route limits rather than inheriting Kimi Code entitlement.
+        app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
+        let direct = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+        assert!(
+            !direct.is_error,
+            "direct Moonshot route remains valid: {direct:?}"
+        );
+        assert_ne!(
+            app.active_route_limits
+                .and_then(|limits| limits.context_tokens),
+            Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
+        );
+    }
+
+    #[test]
     fn model_command_persists_active_provider_model_scoped() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
@@ -1287,6 +1357,9 @@ mod tests {
         assert!(msg.contains("Moonshot/Kimi (moonshot)"));
         assert!(msg.contains("https://platform.kimi.ai/console/api-keys"));
         assert!(msg.contains("https://platform.kimi.ai/docs/overview"));
+        assert!(msg.contains("https://api.kimi.com/coding/v1"));
+        assert!(msg.contains("https://www.kimi.com/code/console"));
+        assert!(msg.contains("never imports Kimi CLI credentials"));
         assert!(msg.contains("https://console.openmodel.ai/"));
         assert!(msg.contains("https://docs.openmodel.ai/en/docs/getting-started/authentication"));
         assert!(msg.contains("https://console.sakana.ai/api-keys"));

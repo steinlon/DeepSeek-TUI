@@ -310,11 +310,19 @@ impl SetupRuntimeFacts {
                 crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
             );
         let model = app.model_display_label();
-        let provider = if app.api_provider == crate::config::ApiProvider::Custom {
+        let provider_name = if app.api_provider == crate::config::ApiProvider::Custom {
             app.provider_identity_for_persistence().to_string()
         } else {
             app.api_provider.display_name().to_string()
         };
+        let context_window = crate::route_budget::route_context_window_tokens(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+        );
+        let context_window_source = app.active_context_window_source.label();
+        let provider =
+            format!("{provider_name} · context {context_window} ({context_window_source})");
         let auth = readiness.label().into_owned();
         let health = if provider_ready {
             format!("{}; route can be attempted", readiness.label())
@@ -328,7 +336,12 @@ impl SetupRuntimeFacts {
                 "{}; run codex login, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or open /provider",
                 readiness.label()
             )
-        } else if let Some(url) = app.api_provider.credential_help().credential_url {
+        } else if let Some(url) = crate::config::credential_help_for_provider_route(
+            app.api_provider,
+            &config.deepseek_base_url(),
+        )
+        .credential_url
+        {
             format!(
                 "{}; credentials: {url}; open /provider to repair the route",
                 readiness.label()
@@ -337,13 +350,19 @@ impl SetupRuntimeFacts {
             format!(
                 "{}; {}; open /provider to repair the route",
                 readiness.label(),
-                app.api_provider.credential_help().guidance
+                crate::config::credential_help_for_provider_route(
+                    app.api_provider,
+                    &config.deepseek_base_url(),
+                )
+                .guidance
             )
         };
         let provider_result = format!(
-            "provider={}, model={}, auth={}, health={}",
+            "provider={}, model={}, context_window={} ({}) auth={}, health={}",
             app.provider_identity_for_persistence(),
             model,
+            context_window,
+            context_window_source,
             readiness.label(),
             if provider_ready {
                 "attemptable"
@@ -4380,6 +4399,66 @@ mod tests {
 
         assert!(text.contains("NVIDIA NIM"), "{text}");
         assert!(text.contains("credentials: https://build.nvidia.com/settings/api-keys"));
+    }
+
+    #[test]
+    fn provider_model_detail_lines_use_kimi_code_membership_console_for_exact_route() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _moonshot_key = crate::test_support::EnvVarGuard::remove("MOONSHOT_API_KEY");
+        let _kimi_key = crate::test_support::EnvVarGuard::remove("KIMI_API_KEY");
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut app = App::new(setup_test_options(workspace), &config);
+        app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
+        let resolution = crate::route_runtime::resolve_route_candidate_with_context_metadata(
+            app.api_provider,
+            Some(crate::config::KIMI_CODE_K3_MODEL),
+            Some(crate::config::KIMI_CODE_K3_MODEL),
+            Some(config.deepseek_base_url()),
+            None,
+            None,
+        )
+        .expect("bare k3 on the Kimi Code route must resolve");
+        app.set_active_route_resolution(
+            resolution.candidate.endpoint.base_url,
+            resolution.candidate.limits,
+            resolution.context_window.source,
+        );
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+        let view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            facts,
+        );
+
+        let text = lines_to_text(view.provider_model_detail_lines());
+
+        assert!(text.contains("Moonshot/Kimi"), "{text}");
+        assert!(text.contains("static Kimi Code safe floor"), "{text}");
+        assert!(
+            text.contains(crate::config::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
+            "{text}"
+        );
+        assert!(!text.contains("https://platform.kimi.ai/console/api-keys"));
     }
 
     #[test]

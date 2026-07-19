@@ -67,9 +67,7 @@ use crate::localization::{MessageId, tr};
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Usage};
 use crate::palette;
 use crate::prompts;
-use crate::route_runtime::{
-    resolve_route_candidate, resolve_runtime_route, resolve_runtime_route_for_identity,
-};
+use crate::route_runtime::{resolve_runtime_route, resolve_runtime_route_for_identity};
 use crate::session_manager::{
     OfflineQueueState, QueuedSessionMessage, SavedSession, SessionManager,
     create_saved_session_with_id_and_mode, create_saved_session_with_mode,
@@ -8772,6 +8770,7 @@ async fn switch_provider(
     let target_identity = target_identity_record.key.clone();
     let resolved_endpoint = validated_route.candidate.endpoint.base_url.clone();
     let route_limits = validated_route.candidate.limits;
+    let context_window_source = validated_route.context_window.source;
     let new_model = validated_route.model.clone();
     *config = *validated_route.config;
 
@@ -8794,7 +8793,7 @@ async fn switch_provider(
     app.apply_provider_switch_reasoning_effort(target, &new_base_url, model_override.as_deref());
     app.set_model_selection(new_model.clone());
     app.set_active_context_window_override(config.context_window_for_provider_config(target));
-    app.set_active_route_limits(route_limits);
+    app.set_active_route_resolution(new_base_url.clone(), route_limits, context_window_source);
     if model_override.is_some() {
         app.provider_models
             .insert(target_identity.clone(), new_model.clone());
@@ -8921,6 +8920,7 @@ async fn apply_provider_fallback_switch(
     let resolved_endpoint = resolved_route.candidate.endpoint.base_url.clone();
     let next_config = resolved_route.config;
     let new_model = resolved_route.model;
+    let context_window_source = resolved_route.context_window.source;
 
     if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.set_provider_identity_record(previous_identity);
@@ -8944,10 +8944,16 @@ async fn apply_provider_fallback_switch(
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.model_ids_passthrough = config.model_ids_pass_through();
-    app.reasoning_effort = app.reasoning_effort.normalize_for_provider(target);
+    app.reasoning_effort =
+        app.reasoning_effort
+            .normalize_for_route(target, &new_base_url, &new_model);
     app.set_model_selection(new_model.clone());
     app.set_active_context_window_override(config.context_window_for_provider_config(target));
-    app.set_active_route_limits(resolved_route.candidate.limits);
+    app.set_active_route_resolution(
+        new_base_url.clone(),
+        resolved_route.candidate.limits,
+        context_window_source,
+    );
     app.update_model_compaction_budget();
     if cache_scope_changed {
         app.clear_model_scoped_telemetry();
@@ -13674,9 +13680,17 @@ fn restore_loaded_session_provider(app: &mut App, config: &mut Config, identity:
         .filter(|chain| chain.providers().len() > 1);
     app.last_fallback_reason = None;
     app.model_ids_passthrough = config.model_ids_pass_through();
-    app.reasoning_effort = app.reasoning_effort.normalize_for_provider(provider);
+    app.reasoning_effort =
+        app.reasoning_effort
+            .normalize_for_route(provider, &config.deepseek_base_url(), &app.model);
     app.set_active_context_window_override(config.context_window_for_provider_config(provider));
     app.active_route_limits = app.context_window_override_limits();
+    app.active_route_base_url = config.deepseek_base_url();
+    app.active_context_window_source = if app.active_context_window_override.is_some() {
+        crate::route_runtime::ContextWindowSource::Configured
+    } else {
+        crate::route_runtime::ContextWindowSource::Fallback
+    };
 }
 
 fn resolve_loaded_session_route(app: &mut App, config: &Config) {
@@ -13684,22 +13698,41 @@ fn resolve_loaded_session_route(app: &mut App, config: &Config) {
     app.set_active_context_window_override(context_override);
     if app.auto_model {
         app.active_route_limits = app.context_window_override_limits();
+        app.active_route_base_url = config.deepseek_base_url();
+        app.active_context_window_source = if context_override.is_some() {
+            crate::route_runtime::ContextWindowSource::Configured
+        } else {
+            crate::route_runtime::ContextWindowSource::Fallback
+        };
         return;
     }
 
     let saved_provider_model = config
         .provider_config_for(app.api_provider)
         .and_then(|provider| provider.model.as_deref());
-    app.active_route_limits = resolve_route_candidate(
+    match crate::route_runtime::resolve_route_candidate_with_context_metadata(
         app.api_provider,
         Some(&app.model),
         saved_provider_model,
         Some(config.deepseek_base_url()),
         context_override,
-    )
-    .ok()
-    .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
-    .or_else(|| app.context_window_override_limits());
+        None,
+    ) {
+        Ok(resolution) => app.set_active_route_resolution(
+            resolution.candidate.endpoint.base_url,
+            resolution.candidate.limits,
+            resolution.context_window.source,
+        ),
+        Err(_) => {
+            app.active_route_limits = app.context_window_override_limits();
+            app.active_route_base_url = config.deepseek_base_url();
+            app.active_context_window_source = if context_override.is_some() {
+                crate::route_runtime::ContextWindowSource::Configured
+            } else {
+                crate::route_runtime::ContextWindowSource::Fallback
+            };
+        }
+    }
 }
 
 /// Derive a short display title from the API message list.

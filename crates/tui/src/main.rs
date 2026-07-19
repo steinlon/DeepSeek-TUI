@@ -5927,6 +5927,24 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
     let target = doctor_api_target(config);
     let provider = config.api_provider();
     let redacted_base_url = crate::client::redact_url_for_display(&target.base_url);
+    let context_window = crate::route_runtime::resolve_runtime_route(
+        config,
+        provider,
+        Some(&target.model),
+    )
+    .ok()
+    .map(|route| {
+        json!({
+            "tokens": route.context_window.tokens,
+            "source": route.context_window.source.label(),
+        })
+    })
+    .unwrap_or_else(|| {
+        json!({
+            "tokens": crate::config::provider_capability(provider, &target.model).context_window,
+            "source": crate::route_runtime::ContextWindowSource::Fallback.label(),
+        })
+    });
 
     json!({
         "provider": target.provider,
@@ -5943,6 +5961,7 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
             "scheme": doctor_auth_scheme(config),
             "source": doctor_api_key_source_label(resolve_api_key_source(config)),
         },
+        "context_window": context_window,
     })
 }
 
@@ -11774,6 +11793,33 @@ mod doctor_endpoint_tests {
         assert_eq!(report["auth"]["scheme"], "bearer");
         assert_eq!(report["auth"]["source"], "config");
         assert!(!serialized.contains("sf-cn-secret-value"));
+    }
+
+    #[test]
+    fn doctor_route_report_names_kimi_code_context_provenance() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("kimi-plan-secret".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = doctor_route_report(&config);
+        let serialized = report.to_string();
+
+        assert_eq!(report["context_window"]["tokens"], 262_144);
+        assert_eq!(
+            report["context_window"]["source"],
+            "static Kimi Code safe floor"
+        );
+        assert!(!serialized.contains("kimi-plan-secret"));
     }
 
     #[test]

@@ -308,6 +308,7 @@
     "LinksTitle": "プロバイダーリンク：",
     "LinksDashboard": "ダッシュボード：",
     "LinksDocs": "ドキュメント：",
+    "LinksKimiCodeRouteNote": "Kimi Code メンバーシッププランのルート: `{route}`（プランコンソール: `{console}`、モデル k3 を使用）。Codewhale が Kimi CLI の資格情報を取り込むことはありません。",
     "LinksTip": "ヒント: 表示されたプロバイダー用の環境変数を使うか、`codewhale auth set --provider <id>` でキーを保存してください。",
     "SubagentsFetching": "Fleetワーカー状態を取得中...",
     "HelpUnknownCommand": "不明なコマンド: {topic}",

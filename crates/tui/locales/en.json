@@ -308,6 +308,7 @@
     "LinksTitle": "Provider Links:",
     "LinksDashboard": "Dashboard:",
     "LinksDocs": "Docs:",
+    "LinksKimiCodeRouteNote": "Kimi Code membership-plan route: `{route}` (plan console: `{console}`; use model k3). Codewhale never imports Kimi CLI credentials.",
     "LinksTip": "Tip: Use the env var shown for your provider, or save the key with `codewhale auth set --provider <id>`.",
     "SubagentsFetching": "Fetching Fleet status...",
     "HelpUnknownCommand": "Unknown command: {topic}",

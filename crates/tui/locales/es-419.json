@@ -308,6 +308,7 @@
     "LinksTitle": "Enlaces de proveedores:",
     "LinksDashboard": "Panel:",
     "LinksDocs": "Documentación:",
+    "LinksKimiCodeRouteNote": "Ruta del plan de membresía Kimi Code: `{route}` (consola del plan: `{console}`; usa el modelo k3). Codewhale nunca importa credenciales de Kimi CLI.",
     "LinksTip": "Tip: usa la variable de entorno mostrada para tu proveedor o guarda la clave con `codewhale auth set --provider <id>`.",
     "SubagentsFetching": "Obteniendo estado de workers Fleet...",
     "HelpUnknownCommand": "Comando desconocido: {topic}",
