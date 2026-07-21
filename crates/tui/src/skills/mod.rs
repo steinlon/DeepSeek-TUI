@@ -1,5 +1,6 @@
 //! Skill discovery and registry for local SKILL.md files.
 
+pub mod audit;
 pub mod install;
 pub mod roots;
 mod system;
@@ -18,6 +19,8 @@ pub use roots::{
     CompatibleHarness, SkillRootAccess, SkillRootCatalog, SkillRootDescriptor, SkillRootId,
     SkillRootKind, SkillScope, classify_configured_skills_dir, safe_display_path,
 };
+#[allow(unused_imports)]
+pub use system::{bundled_skill_body_sha256, is_exact_bundled_skill};
 pub use system::{install_system_skills, is_bundled_skill_name};
 
 use std::fs;
@@ -625,7 +628,7 @@ fn is_valid_skill_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
 }
 
-fn normalize_skill_name_for_lookup(name: &str) -> String {
+pub(crate) fn normalize_skill_name_for_lookup(name: &str) -> String {
     if let Some((plugin, skill)) = name.trim().split_once(':')
         && !plugin.is_empty()
         && !skill.is_empty()
