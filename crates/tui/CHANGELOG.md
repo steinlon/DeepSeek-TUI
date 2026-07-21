@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-20
+
+### Changed
+
+- Unified shell tool: the model now sees a single `Bash` tool with an `action`
+  parameter (run/wait/interact/cancel). Legacy `exec_shell*` names remain as
+  hidden compat aliases for transcript replay, and the tool-search catalog
+  keeps `Bash` active by default (#4625).
+- Tool output inline preview increased from 6 to 12 lines (4 head + 4 tail)
+  before the fold indicator; full pager (`v` key) unchanged (#4603).
+- Mode changes (`/mode agent|plan|operate`) now persist to `settings.toml`
+  and restore across sessions (#4628).
+- Billing provenance: every outgoing API request carries an
+  `x-codewhale-provenance` header with client version and provider (#4324).
+
+### Added
+
+- `PublicRole` enum (Planner/Worker/Reviewer/Verifier) — canonical public
+  role vocabulary with alias parser and `SubAgentType` mapping (#3934).
+- `load_skill` tool now supports listing: omit `name` or pass `"list"` to
+  see all available skills without loading one (#4651).
+
+### Fixed
+
+- System-prompt skills block and skill-load warnings no longer embed absolute
+  home/workspace paths; entries render workspace-relative or `~/…` so the
+  byte-stable prompt prefix never leaks private paths. A new invariant test
+  guards absolute paths, API keys, and workspace paths in the prefix (#4632).
+- Mode/permission baseline unit tests no longer read the developer's live
+  `settings.toml`; they isolate config I/O to a temp directory (#4628).
+
 ## [0.8.68] - 2026-07-10
 
 ### Changed

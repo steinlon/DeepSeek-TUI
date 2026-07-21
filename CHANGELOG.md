@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-20
+
+### Changed
+
+- Unified shell tool: the model now sees a single `Bash` tool with an `action`
+  parameter (run/wait/interact/cancel). Legacy `exec_shell*` names remain as
+  hidden compat aliases for transcript replay, and the tool-search catalog
+  keeps `Bash` active by default (#4625).
+- Tool output inline preview increased from 6 to 12 lines (4 head + 4 tail)
+  before the fold indicator; full pager (`v` key) unchanged (#4603).
+- Mode changes (`/mode agent|plan|operate`) now persist to `settings.toml`
+  and restore across sessions (#4628).
+- Billing provenance: every outgoing API request carries an
+  `x-codewhale-provenance` header with client version and provider (#4324).
+
+### Added
+
+- `PublicRole` enum (Planner/Worker/Reviewer/Verifier) — canonical public
+  role vocabulary with alias parser and `SubAgentType` mapping (#3934).
+- `load_skill` tool now supports listing: omit `name` or pass `"list"` to
+  see all available skills without loading one (#4651).
+
+### Fixed
+
+- System-prompt skills block and skill-load warnings no longer embed absolute
+  home/workspace paths; entries render workspace-relative or `~/…` so the
+  byte-stable prompt prefix never leaks private paths. A new invariant test
+  guards absolute paths, API keys, and workspace paths in the prefix (#4632).
+- Mode/permission baseline unit tests no longer read the developer's live
+  `settings.toml`; they isolate config I/O to a temp directory (#4628).
+
+## [0.9.0] - 2026-07-16
+
+### Added
+
+- Operate mode: bounded-leaf delegation with declarative step/wall-time limits,
+  promoted artifacts, and explicit tool-free roles (#4386).
+- Fleet runtime: worker receipts, launch-queue wait accounting, terminal
+  blocked-gate failure propagation.
+- Named custom-provider identity across TUI sessions, `exec --resume`,
+  runtime threads, Fleet receipts, exports, and fail-closed restore (#4334).
+- Approval-time transcript review (#4371).
+- First-turn `remember` catalog (#4373, #4377).
+- Required confirmation blockers (#4374).
+
+### Changed
+
+- Bounded `@` discovery walks with configurable depth (#4365).
+- Kimi context budgeting (#4368, #4378).
+- Simplified Chinese setup terminology (#4369).
+- Cached approval denial recovery (#4375, #4385).
+- Automation `auto_approve` defaults false; fd/rg/git grep exec flags
+  require approval.
+
+### Fixed
+
+- Underwater shell: Operate spawn depth=0 by default, unified permission
+  resolver, constitution skill/role binding.
+
 ## [0.8.68] - 2026-07-10
 
 ### Changed
