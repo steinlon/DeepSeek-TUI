@@ -8192,6 +8192,17 @@ async fn send_taken_queued_message_now(
     }
 
     let display = message.display.clone();
+    if app.dispatch_in_flight {
+        // A spawned dispatch is still resolving route/sending its op (#4605):
+        // there is no turn to steer into yet. Re-queue; the completion/turn
+        // lifecycle will drive the next drain.
+        restore_queued_message(app, restore_index, message);
+        app.status_message = Some(format!(
+            "{} queued follow-up(s) — sends after current dispatch starts",
+            app.queued_message_count()
+        ));
+        return Ok(());
+    }
     if app.is_loading {
         if let Err(err) = steer_user_message(app, engine_handle, message.clone()).await {
             restore_queued_message(app, restore_index, message);
@@ -8740,6 +8751,9 @@ async fn dispatch_user_message_with_recovery(
     };
 
     // #4605: spawn the async phase so the event loop can draw immediately.
+    // Mark the dispatch in flight so a submit after an Esc-cancel queues
+    // instead of spawning a second dispatch that could reorder ops.
+    app.dispatch_in_flight = true;
     tokio::spawn(spawned_dispatch_execute(
         prepare,
         recovery,
@@ -8950,6 +8964,7 @@ fn build_dispatch_success_closure(
 ) -> crate::tui::app::DispatchApplyFn {
     Box::new(
         move |app: &mut App, engine_handle: &EngineHandle, config: &Config| -> anyhow::Result<()> {
+            app.dispatch_in_flight = false;
             prepare.paused_dispatch.apply(app, engine_handle);
 
             let dispatch_started_at = Instant::now();
@@ -9045,6 +9060,7 @@ fn build_dispatch_error_closure(
               _engine_handle: &EngineHandle,
               _config: &Config|
               -> anyhow::Result<()> {
+            app.dispatch_in_flight = false;
             // Roll back the optimistic sync prepare mutations.
             app.is_loading = prepare.snapshot.is_loading;
             app.runtime_turn_status = prepare.snapshot.runtime_turn_status.clone();

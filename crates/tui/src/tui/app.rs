@@ -1892,6 +1892,11 @@ pub struct App {
     /// event loop. The closure is called with `&mut App` so the async phase
     /// never needs `&mut App` while awaiting network I/O (#4605).
     pub dispatch_completion_tx: Option<tokio::sync::mpsc::UnboundedSender<DispatchApplyFn>>,
+    /// True while a spawned dispatch task is in flight (#4605). Set in the
+    /// sync prepare phase and cleared when the completion closure runs, so a
+    /// submit after an Esc-cancel (which clears `is_loading`) still queues
+    /// instead of spawning a second dispatch that could reorder ops.
+    pub dispatch_in_flight: bool,
     /// Timestamp of the most recent Enter while the engine was busy.
     /// Used by `enter_with_double_tap()` to detect a double-tap within 500 ms.
     pub last_enter_instant: Option<Instant>,
@@ -3309,6 +3314,7 @@ impl App {
             api_messages: Vec::new(),
             is_loading: false,
             dispatch_completion_tx: None,
+            dispatch_in_flight: false,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,
@@ -6698,6 +6704,11 @@ impl App {
     #[must_use]
     pub fn decide_submit_disposition(&self) -> SubmitDisposition {
         if self.offline_mode {
+            return SubmitDisposition::Queue;
+        }
+        // A spawned dispatch is still resolving route/sending the op (#4605);
+        // queue rather than spawn a second dispatch that could reorder ops.
+        if self.dispatch_in_flight {
             return SubmitDisposition::Queue;
         }
         if !self.is_loading {
