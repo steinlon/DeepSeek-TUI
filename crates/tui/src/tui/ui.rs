@@ -9069,19 +9069,24 @@ fn build_dispatch_error_closure(
                 }
                 DispatchRecovery::Queued { restore_index } => {
                     restore_queued_message(app, restore_index, prepare.message);
-                    app.status_message = Some(format!(
-                        "Dispatch failed ({error}); kept {} queued follow-up(s)",
-                        app.queued_message_count()
-                    ));
+                    app.status_message = Some(
+                        app.tr(MessageId::DispatchFailedQueued)
+                            .replace("{error}", &error)
+                            .replace("{count}", &app.queued_message_count().to_string()),
+                    );
                 }
                 DispatchRecovery::Initial => {
-                    app.status_message = Some(format!("Initial prompt could not be sent: {error}"));
+                    app.status_message = Some(
+                        app.tr(MessageId::DispatchFailedInitial)
+                            .replace("{error}", &error),
+                    );
                 }
                 DispatchRecovery::PlanFollowup => {
                     app.queue_message(prepare.message);
-                    app.status_message = Some(format!(
-                        "Plan follow-up could not be sent; it has been re-queued: {error}"
-                    ));
+                    app.status_message = Some(
+                        app.tr(MessageId::DispatchFailedPlanFollowup)
+                            .replace("{error}", &error),
+                    );
                 }
             }
 

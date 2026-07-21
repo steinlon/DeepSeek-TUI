@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "编写任务或使用 /。",
     "ComposerDispatchFailedRestored": "消息未发送（{error}）；已恢复到输入框。",
+    "DispatchFailedQueued": "发送失败（{error}）；保留了 {count} 个排队后续消息。",
+    "DispatchFailedInitial": "初始提示无法发送：{error}",
+    "DispatchFailedPlanFollowup": "计划后续无法发送；已重新排队：{error}",
     "HistorySearchPlaceholder": "搜索提示历史...",
     "HistorySearchTitle": "历史搜索",
     "HistoryHintMove": "Up/Down 移动",

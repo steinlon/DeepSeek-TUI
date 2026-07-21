@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "Write a task or use /.",
     "ComposerDispatchFailedRestored": "Message not sent ({error}); restored to composer.",
+    "DispatchFailedQueued": "Dispatch failed ({error}); kept {count} queued follow-up(s).",
+    "DispatchFailedInitial": "Initial prompt could not be sent: {error}",
+    "DispatchFailedPlanFollowup": "Plan follow-up could not be sent; it has been re-queued: {error}",
     "HistorySearchPlaceholder": "Search prompt history...",
     "HistorySearchTitle": "History Search",
     "HistoryHintMove": "Up/Down move",

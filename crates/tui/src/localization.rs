@@ -86,6 +86,9 @@ impl Locale {
 pub enum MessageId {
     ComposerPlaceholder,
     ComposerDispatchFailedRestored,
+    DispatchFailedQueued,
+    DispatchFailedInitial,
+    DispatchFailedPlanFollowup,
     HistorySearchPlaceholder,
     HistorySearchTitle,
     HistoryHintMove,
@@ -1159,6 +1162,9 @@ pub enum MessageId {
 pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ComposerPlaceholder,
     MessageId::ComposerDispatchFailedRestored,
+    MessageId::DispatchFailedQueued,
+    MessageId::DispatchFailedInitial,
+    MessageId::DispatchFailedPlanFollowup,
     MessageId::HistorySearchPlaceholder,
     MessageId::HistorySearchTitle,
     MessageId::HistoryHintMove,

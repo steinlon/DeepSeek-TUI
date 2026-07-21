@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "Escreva uma tarefa ou use /.",
     "ComposerDispatchFailedRestored": "Mensagem não enviada ({error}); restaurada no compositor.",
+    "DispatchFailedQueued": "Falha ao enviar ({error}); {count} acompanhamentos na fila mantidos.",
+    "DispatchFailedInitial": "Não foi possível enviar o prompt inicial: {error}",
+    "DispatchFailedPlanFollowup": "Não foi possível enviar o acompanhamento do plano; foi re-enfileirado: {error}",
     "HistorySearchPlaceholder": "Pesquisar histórico de prompts...",
     "HistorySearchTitle": "Busca no histórico",
     "HistoryHintMove": "Up/Down move",

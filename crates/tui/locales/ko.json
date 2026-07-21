@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "작업을 입력하거나 /를 사용하세요.",
     "ComposerDispatchFailedRestored": "메시지를 보내지 못했습니다({error}). 작성란에 복원했습니다.",
+    "DispatchFailedQueued": "전송 실패 ({error}); 대기 중인 후속 메시지 {count}개를 보존했습니다.",
+    "DispatchFailedInitial": "초기 프롬프트를 전송할 수 없습니다: {error}",
+    "DispatchFailedPlanFollowup": "계획 후속 메시지를 전송할 수 없습니다. 다시 대기열에 추가했습니다: {error}",
     "HistorySearchPlaceholder": "프롬프트 기록 검색...",
     "HistorySearchTitle": "기록 검색",
     "HistoryHintMove": "Up/Down 이동",

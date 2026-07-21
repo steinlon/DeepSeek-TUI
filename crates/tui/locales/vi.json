@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "Nhập nhiệm vụ hoặc sử dụng /.",
     "ComposerDispatchFailedRestored": "Chưa gửi được tin nhắn ({error}); đã khôi phục vào ô soạn thảo.",
+    "DispatchFailedQueued": "Gửi thất bại ({error}); giữ lại {count} tin nhắn theo dõi trong hàng đợi.",
+    "DispatchFailedInitial": "Không thể gửi lời nhắc ban đầu: {error}",
+    "DispatchFailedPlanFollowup": "Không thể gửi tin nhắn theo dõi kế hoạch; đã xếp lại hàng đợi: {error}",
     "HistorySearchPlaceholder": "Tìm kiếm lịch sử câu lệnh...",
     "HistorySearchTitle": "Tìm kiếm lịch sử",
     "HistoryHintMove": "Lên/Xuống để di chuyển",

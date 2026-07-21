@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "Escribe una tarea o usa /.",
     "ComposerDispatchFailedRestored": "No se envió el mensaje ({error}); se restauró en el editor.",
+    "DispatchFailedQueued": "Error al enviar ({error}); se mantuvieron {count} mensajes de seguimiento en cola.",
+    "DispatchFailedInitial": "No se pudo enviar el prompt inicial: {error}",
+    "DispatchFailedPlanFollowup": "No se pudo enviar el seguimiento del plan; se volvió a encolar: {error}",
     "HistorySearchPlaceholder": "Buscar en el historial de prompts...",
     "HistorySearchTitle": "Búsqueda en el historial",
     "HistoryHintMove": "Arriba/Abajo mover",

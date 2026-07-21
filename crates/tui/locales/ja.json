@@ -1,6 +1,9 @@
 {
     "ComposerPlaceholder": "タスクを書くか / を使う。",
     "ComposerDispatchFailedRestored": "メッセージを送信できませんでした（{error}）。入力欄に復元しました。",
+    "DispatchFailedQueued": "送信に失敗しました（{error}）。キューされたフォローアップを {count} 件保持しました。",
+    "DispatchFailedInitial": "初期プロンプトを送信できませんでした: {error}",
+    "DispatchFailedPlanFollowup": "Plan のフォローアップを送信できませんでした。キューに戻しました: {error}",
     "HistorySearchPlaceholder": "プロンプト履歴を検索...",
     "HistorySearchTitle": "履歴検索",
     "HistoryHintMove": "Up/Down 移動",
