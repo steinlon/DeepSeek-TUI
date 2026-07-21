@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::path::{Component, Path};
 
 use ratatui::layout::Rect;
 
-use crate::localization::MessageId;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus};
 use crate::tui::app::{App, SidebarRowAction};
+use crate::tui::history::{FileActivityKind, FileActivitySummary, HistoryCell};
 use crate::work_graph::{
     AcceptanceRequirement, EdgeKind, EvidenceKind, EvidenceKindTag, NodeKind, NodeState,
     OperationBinding, OwnerState, Provenance, WorkGraphSnapshot, WorkNode,
@@ -191,10 +193,9 @@ impl WorkSurfaceState {
 }
 
 pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
-    let todo_label = app.tr(MessageId::SidebarTodoLabel).into_owned();
-    let todo_progress = app.tr(MessageId::WorkSurfaceTodoProgress).into_owned();
-    let plan_label = app.tr(MessageId::AppModePlan).into_owned();
     let active_session = app.current_session_id.is_some();
+    let agents = agent_rows(app);
+    let activity = settled_file_activity(app);
     let capture = app.runtime_services.work.as_ref().map(|work| {
         work.try_capture(app.current_session_id.as_deref())
             .map(|snapshot| snapshot.map(|snapshot| snapshot.graph))
@@ -220,13 +221,10 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     };
 
     let rows = match graph {
-        Some(graph) => graph_rows(
-            &graph,
-            source_state.as_ref(),
-            &todo_label,
-            &todo_progress,
-            &plan_label,
-        ),
+        Some(graph) => graph_rows(&graph, source_state.as_ref(), agents, activity),
+        None if !agents.is_empty() || !activity.is_empty() => {
+            ordered_rows(None, source_state.as_ref(), agents, activity)
+        }
         None => source_state.map_or_else(Vec::new, |state| {
             vec![section_heading(
                 "work",
@@ -247,135 +245,466 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
 fn graph_rows(
     snapshot: &WorkGraphSnapshot,
     source_state: Option<&WorkSourceState>,
-    todo_label: &str,
-    todo_progress: &str,
-    plan_label: &str,
+    agents: Vec<RankedWorkRow>,
+    activity: SettledFileActivity,
 ) -> Vec<WorkRow> {
-    let visible = snapshot
-        .nodes
+    ordered_rows(Some(snapshot), source_state, agents, activity)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkBucket {
+    Active,
+    Attention,
+    Ready,
+    Recent,
+}
+
+impl WorkBucket {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Attention => 1,
+            Self::Ready => 2,
+            Self::Recent => 3,
+        }
+    }
+}
+
+struct RankedWorkRow {
+    bucket: WorkBucket,
+    order: usize,
+    row: WorkRow,
+}
+
+#[derive(Default)]
+struct SettledFileActivity {
+    summary: FileActivitySummary,
+    read: Vec<String>,
+    list: Vec<String>,
+    search: Vec<String>,
+    write: Vec<String>,
+}
+
+impl SettledFileActivity {
+    fn is_empty(&self) -> bool {
+        self.summary.is_empty()
+    }
+}
+
+fn ordered_rows(
+    snapshot: Option<&WorkGraphSnapshot>,
+    source_state: Option<&WorkSourceState>,
+    mut ranked: Vec<RankedWorkRow>,
+    activity: SettledFileActivity,
+) -> Vec<WorkRow> {
+    if let Some(snapshot) = snapshot {
+        ranked.extend(
+            snapshot
+                .nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        NodeKind::PlanStep | NodeKind::Operation | NodeKind::Blocker
+                    )
+                })
+                .filter(|node| !is_settled_transient_operation(node))
+                .enumerate()
+                .map(|(order, node)| RankedWorkRow {
+                    bucket: node_bucket(node),
+                    order: 10_000usize.saturating_add(order),
+                    row: graph_node_row(snapshot, node),
+                }),
+        );
+    }
+    ranked.extend(activity_rows(activity));
+    ranked.sort_by_key(|item| (item.bucket.rank(), item.order));
+
+    let active = ranked
         .iter()
-        .filter(|node| {
-            matches!(
-                node.kind,
-                NodeKind::PlanStep | NodeKind::Operation | NodeKind::Blocker
-            )
-        })
-        .filter(|node| !is_settled_transient_operation(node))
-        .collect::<Vec<_>>();
-    let running = visible
-        .iter()
-        .filter(|node| matches!(node.state, NodeState::Initializing | NodeState::Active))
+        .filter(|item| item.bucket == WorkBucket::Active)
         .count();
-    let waiting = visible
+    let attention = ranked
         .iter()
-        .filter(|node| node.state == NodeState::Waiting)
+        .filter(|item| item.bucket == WorkBucket::Attention)
         .count();
-    let ready = visible
+    let ready = ranked
         .iter()
-        .filter(|node| node.state == NodeState::Ready)
+        .filter(|item| item.bucket == WorkBucket::Ready)
         .count();
-    let blocked = visible
+    let recent = ranked
         .iter()
-        .filter(|node| node_is_attention(node))
+        .filter(|item| item.bucket == WorkBucket::Recent)
         .count();
-    let status = source_state
-        .map(|state| format!(" · {} · cached r{}", state.label(), snapshot.revision))
+    let source = source_state
+        .map(|state| format!(" · {}", state.label()))
         .unwrap_or_default();
-    let detail = source_state.map_or_else(
-        || format!("graph revision {}", snapshot.revision),
-        |state| format!("graph revision {} · {}", snapshot.revision, state.detail()),
-    );
-    let waiting = if waiting > 0 {
-        format!(" · {waiting} waiting")
-    } else {
-        String::new()
+    let detail = match (snapshot, source_state) {
+        (Some(snapshot), Some(state)) => {
+            format!("graph revision {} · {}", snapshot.revision, state.detail())
+        }
+        (Some(snapshot), None) => format!("graph revision {}", snapshot.revision),
+        (None, Some(state)) => state.detail().to_string(),
+        (None, None) => "Current session activity".to_string(),
     };
     let mut rows = vec![section_heading(
         "work",
-        &format!("Work · {running} running{waiting} · {ready} ready · {blocked} blocked{status}"),
+        &format!(
+            "Work · {active} active · {attention} needs input · {ready} ready · {recent} recent{source}"
+        ),
         &detail,
     )];
-
-    // Runtime operations and blockers are live/attention state. Cleanly
-    // settled non-durable operations are graph receipts, not permanent chrome,
-    // and were filtered above. Keep the remaining operational rows first.
-    rows.extend(
-        visible
-            .iter()
-            .copied()
-            .filter(|node| node.kind != NodeKind::PlanStep)
-            .map(|node| graph_node_row(snapshot, node)),
-    );
-
-    // The Work Graph is authoritative, but the explicit To-do grouping is a
-    // useful projection contract. Preserve compat ordering and do not flatten
-    // durable checklist rows into transient shell activity.
-    let mut rendered_plan_nodes = HashSet::new();
-    let todo_nodes = snapshot
-        .compat
-        .todos
-        .iter()
-        .filter_map(|binding| snapshot.node(&binding.node))
-        .filter(|node| visible.iter().any(|candidate| candidate.id == node.id))
-        .collect::<Vec<_>>();
-    if !todo_nodes.is_empty() {
-        let completed = todo_nodes
-            .iter()
-            .filter(|node| matches!(node.state, NodeState::Completed | NodeState::Verified))
-            .count();
-        let total = todo_nodes.len();
-        let progress = todo_progress
-            .replace("{label}", todo_label)
-            .replace("{completed}", &completed.to_string())
-            .replace("{total}", &total.to_string())
-            .replace("{remaining}", &total.saturating_sub(completed).to_string());
-        rows.push(section_heading("todo", &progress, todo_label));
-        for node in todo_nodes {
-            rendered_plan_nodes.insert(node.id.clone());
-            rows.push(graph_node_row(snapshot, node));
-        }
-    }
-
-    // Plan-only steps remain visible without duplicating nodes that also back
-    // the To-do compatibility projection.
-    let mut strategy_nodes = snapshot
-        .compat
-        .plan_order
-        .iter()
-        .filter(|id| !rendered_plan_nodes.contains(*id))
-        .filter_map(|id| snapshot.node(id))
-        .filter(|node| visible.iter().any(|candidate| candidate.id == node.id))
-        .collect::<Vec<_>>();
-    for node in visible
-        .iter()
-        .copied()
-        .filter(|node| node.kind == NodeKind::PlanStep)
-    {
-        if !rendered_plan_nodes.contains(&node.id)
-            && !strategy_nodes
-                .iter()
-                .any(|candidate| candidate.id == node.id)
-        {
-            strategy_nodes.push(node);
-        }
-    }
-    if !strategy_nodes.is_empty() {
-        let completed = strategy_nodes
-            .iter()
-            .filter(|node| matches!(node.state, NodeState::Completed | NodeState::Verified))
-            .count();
-        rows.push(section_heading(
-            "strategy",
-            &format!("{plan_label} {completed}/{}", strategy_nodes.len()),
-            plan_label,
-        ));
-        rows.extend(
-            strategy_nodes
-                .into_iter()
-                .map(|node| graph_node_row(snapshot, node)),
-        );
-    }
+    rows.extend(ranked.into_iter().map(|item| item.row));
     rows
+}
+
+fn node_bucket(node: &WorkNode) -> WorkBucket {
+    match node.state {
+        NodeState::Initializing | NodeState::Active => WorkBucket::Active,
+        NodeState::Waiting | NodeState::Blocked | NodeState::Stale | NodeState::Failed => {
+            WorkBucket::Attention
+        }
+        NodeState::Completed if !node.acceptance.is_empty() => WorkBucket::Attention,
+        NodeState::Ready => WorkBucket::Ready,
+        NodeState::Completed
+        | NodeState::Verified
+        | NodeState::Superseded
+        | NodeState::Cancelled => WorkBucket::Recent,
+    }
+}
+
+fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
+    let cached_ids = app
+        .subagent_cache
+        .iter()
+        .filter(|agent| !agent.from_prior_session)
+        .map(|agent| agent.agent_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut rows = app
+        .subagent_cache
+        .iter()
+        .filter(|agent| !agent.from_prior_session)
+        .enumerate()
+        .map(|(order, agent)| {
+            let status = agent
+                .worker_status
+                .map(worker_status_label)
+                .unwrap_or_else(|| subagent_status_label(&agent.status));
+            let bucket = agent
+                .worker_status
+                .map(worker_status_bucket)
+                .unwrap_or_else(|| subagent_status_bucket(&agent.status));
+            let meta = app.agent_progress_meta.get(&agent.agent_id);
+            let role = agent
+                .assignment
+                .role
+                .as_deref()
+                .filter(|role| !role.trim().is_empty())
+                .unwrap_or_else(|| agent.agent_type.as_str());
+            let name = app
+                .agent_label_map
+                .get(&agent.agent_id)
+                .cloned()
+                .or_else(|| agent.nickname.clone())
+                .unwrap_or_else(|| agent.name.clone());
+            let mut facts = vec![
+                status.to_string(),
+                summarize_assignment(&agent.assignment.objective),
+            ];
+            if let Some(tool) = meta.and_then(|meta| meta.current_tool.as_deref()) {
+                facts.push(format!("using {tool}"));
+            }
+            if let Some(files) = meta
+                .map(|meta| meta.files_touched)
+                .filter(|count| *count > 0)
+            {
+                facts.push(format!("{files} files changed"));
+            }
+            RankedWorkRow {
+                bucket,
+                order,
+                row: WorkRow {
+                    id: WorkRowId(format!("worker:{}", agent.agent_id)),
+                    mark: agent_mark(bucket),
+                    label: format!("Agent {name} · {role}"),
+                    detail: facts.join(" · "),
+                    tone: bucket_tone(bucket),
+                    selectable: true,
+                    primary_action: Some(SidebarRowAction::OpenAgentDetail {
+                        agent_id: agent.agent_id.clone(),
+                    }),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut progress_only = app
+        .agent_progress
+        .iter()
+        .filter(|(id, _)| !cached_ids.contains(id.as_str()))
+        .collect::<Vec<_>>();
+    progress_only.sort_by(|(left, _), (right, _)| left.cmp(right));
+    rows.extend(
+        progress_only
+            .into_iter()
+            .enumerate()
+            .map(|(order, (id, progress))| {
+                let meta = app.agent_progress_meta.get(id);
+                let waiting = progress.to_ascii_lowercase().contains("waiting");
+                let bucket = if waiting {
+                    WorkBucket::Attention
+                } else {
+                    WorkBucket::Active
+                };
+                let name = app
+                    .agent_label_map
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id.clone());
+                let mut facts = vec![progress.clone()];
+                if let Some(tool) = meta.and_then(|meta| meta.current_tool.as_deref()) {
+                    facts.push(format!("using {tool}"));
+                }
+                if let Some(files) = meta
+                    .map(|meta| meta.files_touched)
+                    .filter(|count| *count > 0)
+                {
+                    facts.push(format!("{files} files changed"));
+                }
+                RankedWorkRow {
+                    bucket,
+                    order: 5_000usize.saturating_add(order),
+                    row: WorkRow {
+                        id: WorkRowId(format!("worker:{id}")),
+                        mark: agent_mark(bucket),
+                        label: format!("Agent {name}"),
+                        detail: facts.join(" · "),
+                        tone: bucket_tone(bucket),
+                        selectable: true,
+                        primary_action: Some(SidebarRowAction::OpenAgentDetail {
+                            agent_id: id.clone(),
+                        }),
+                    },
+                }
+            }),
+    );
+    rows
+}
+
+fn summarize_assignment(value: &str) -> String {
+    crate::tui::history::summarize_tool_output(value)
+}
+
+fn worker_status_bucket(status: AgentWorkerStatus) -> WorkBucket {
+    match status {
+        AgentWorkerStatus::WaitingForUser
+        | AgentWorkerStatus::Interrupted
+        | AgentWorkerStatus::Failed => WorkBucket::Attention,
+        AgentWorkerStatus::Queued => WorkBucket::Ready,
+        AgentWorkerStatus::Completed | AgentWorkerStatus::Cancelled => WorkBucket::Recent,
+        AgentWorkerStatus::Starting
+        | AgentWorkerStatus::Running
+        | AgentWorkerStatus::ModelWait
+        | AgentWorkerStatus::RunningTool => WorkBucket::Active,
+    }
+}
+
+fn worker_status_label(status: AgentWorkerStatus) -> &'static str {
+    match status {
+        AgentWorkerStatus::Queued => "queued",
+        AgentWorkerStatus::Starting => "starting",
+        AgentWorkerStatus::Running => "running",
+        AgentWorkerStatus::WaitingForUser => "waiting for input",
+        AgentWorkerStatus::ModelWait => "waiting for model",
+        AgentWorkerStatus::RunningTool => "running tool",
+        AgentWorkerStatus::Completed => "completed",
+        AgentWorkerStatus::Failed => "failed",
+        AgentWorkerStatus::Cancelled => "cancelled",
+        AgentWorkerStatus::Interrupted => "interrupted",
+    }
+}
+
+fn subagent_status_bucket(status: &SubAgentStatus) -> WorkBucket {
+    match status {
+        SubAgentStatus::Running => WorkBucket::Active,
+        SubAgentStatus::Interrupted(_)
+        | SubAgentStatus::Failed(_)
+        | SubAgentStatus::BudgetExhausted => WorkBucket::Attention,
+        SubAgentStatus::Completed | SubAgentStatus::Cancelled => WorkBucket::Recent,
+    }
+}
+
+fn subagent_status_label(status: &SubAgentStatus) -> &'static str {
+    match status {
+        SubAgentStatus::Running => "running",
+        SubAgentStatus::Completed => "completed",
+        SubAgentStatus::Interrupted(_) => "interrupted",
+        SubAgentStatus::Failed(_) => "failed",
+        SubAgentStatus::Cancelled => "cancelled",
+        SubAgentStatus::BudgetExhausted => "budget exhausted",
+    }
+}
+
+const fn bucket_tone(bucket: WorkBucket) -> WorkTone {
+    match bucket {
+        WorkBucket::Active => WorkTone::Live,
+        WorkBucket::Attention => WorkTone::Attention,
+        WorkBucket::Ready => WorkTone::Muted,
+        WorkBucket::Recent => WorkTone::Success,
+    }
+}
+
+const fn agent_mark(bucket: WorkBucket) -> &'static str {
+    match bucket {
+        WorkBucket::Active => crate::tui::glyphs::SELECTION,
+        WorkBucket::Attention => crate::tui::glyphs::ATTENTION,
+        WorkBucket::Ready => crate::tui::glyphs::READY,
+        WorkBucket::Recent => crate::tui::glyphs::DONE,
+    }
+}
+
+fn settled_file_activity(app: &App) -> SettledFileActivity {
+    let mut activity = SettledFileActivity::default();
+    let mut seen = HashSet::new();
+    for index in 0..app.virtual_cell_count() {
+        let Some(HistoryCell::Tool(cell)) = app.cell_at_virtual_index(index) else {
+            continue;
+        };
+        if !cell.is_success() {
+            continue;
+        }
+        let Some(detail) = app.tool_detail_record_for_cell(index) else {
+            continue;
+        };
+        let Some(kind) = FileActivitySummary::from_tool_name(&detail.tool_name) else {
+            continue;
+        };
+        if !seen.insert(detail.tool_id.as_str()) {
+            continue;
+        }
+        activity.summary.record(kind);
+        let target = activity_target(&app.workspace, &detail.tool_name, &detail.input, kind);
+        let details = match kind {
+            FileActivityKind::Read => &mut activity.read,
+            FileActivityKind::List => &mut activity.list,
+            FileActivityKind::Search => &mut activity.search,
+            FileActivityKind::Write => &mut activity.write,
+        };
+        if let Some(target) = target
+            && details.len() < 12
+            && !details.contains(&target)
+        {
+            details.push(target);
+        }
+    }
+    activity
+}
+
+fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
+    let summaries = activity.summary.compact_display();
+    let details = [
+        activity.read,
+        activity.list,
+        activity.search,
+        activity.write,
+    ];
+    summaries
+        .into_iter()
+        .zip(details)
+        .enumerate()
+        .map(|(order, (label, details))| {
+            let body = if details.is_empty() {
+                "No safe target detail retained".to_string()
+            } else {
+                details.join("\n")
+            };
+            RankedWorkRow {
+                bucket: WorkBucket::Recent,
+                order: 20_000usize.saturating_add(order),
+                row: WorkRow {
+                    id: WorkRowId(format!("activity:{order}")),
+                    mark: crate::tui::glyphs::DONE,
+                    label: label.clone(),
+                    detail: details
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "settled".to_string()),
+                    tone: WorkTone::Success,
+                    selectable: true,
+                    primary_action: Some(SidebarRowAction::InspectWork {
+                        title: format!("Work · {label}"),
+                        body,
+                        stop_action: None,
+                    }),
+                },
+            }
+        })
+        .collect()
+}
+
+fn activity_target(
+    workspace: &Path,
+    tool_name: &str,
+    input: &serde_json::Value,
+    kind: FileActivityKind,
+) -> Option<String> {
+    if tool_name == "apply_patch"
+        && let Ok(preflight) = crate::tools::apply_patch::preflight_apply_patch(input)
+    {
+        let targets = preflight
+            .touched_files
+            .iter()
+            .filter_map(|path| privacy_safe_path(workspace, path))
+            .take(4)
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            return Some(targets.join(", "));
+        }
+    }
+    let keys: &[&str] = match kind {
+        FileActivityKind::Search => &["pattern", "query", "path"],
+        _ => &["path", "file_path"],
+    };
+    keys.iter().find_map(|key| {
+        let value = input.get(*key)?.as_str()?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if kind == FileActivityKind::Search && *key != "path" {
+            return Some(safe_pattern(value));
+        }
+        privacy_safe_path(workspace, value)
+    })
+}
+
+fn privacy_safe_path(workspace: &Path, raw: &str) -> Option<String> {
+    let path = Path::new(raw);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace).ok()?
+    } else {
+        path
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    let display = relative.to_string_lossy().replace('\\', "/");
+    (!display.is_empty()).then_some(display)
+}
+
+fn safe_pattern(raw: &str) -> String {
+    let single_line = raw.replace(['\n', '\r', '\t'], " ");
+    let mut chars = single_line.chars();
+    let prefix = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn is_settled_transient_operation(node: &WorkNode) -> bool {
@@ -421,6 +750,11 @@ fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {
     };
     let state = state_label(node);
     let kind = kind_label(node.kind);
+    let detail = if node.state == NodeState::Ready && node.kind == NodeKind::PlanStep {
+        kind.to_string()
+    } else {
+        format!("{state} · {kind}")
+    };
     let stop_action = node
         .state
         .is_live()
@@ -430,7 +764,7 @@ fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {
         id: WorkRowId(format!("graph:{}", node.id.as_str())),
         mark,
         label: node.title.clone(),
-        detail: format!("{state} · {kind}"),
+        detail,
         tone,
         selectable: true,
         primary_action: Some(SidebarRowAction::InspectWork {
@@ -439,13 +773,6 @@ fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {
             stop_action: stop_action.map(Box::new),
         }),
     }
-}
-
-fn node_is_attention(node: &WorkNode) -> bool {
-    matches!(
-        node.state,
-        NodeState::Blocked | NodeState::Stale | NodeState::Failed
-    ) || (node.state == NodeState::Completed && !node.acceptance.is_empty())
 }
 
 fn state_label(node: &WorkNode) -> &'static str {
@@ -856,22 +1183,16 @@ mod tests {
             operation(NodeState::Ready, "ready"),
         ];
 
-        let rows = graph_rows(
-            &snapshot,
-            None,
-            "To-do",
-            "{label} {completed}/{total} · {remaining} left",
-            "Plan",
-        );
+        let rows = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default());
 
         assert_eq!(
             rows.first().map(|row| row.label.as_str()),
-            Some("Work · 2 running · 1 ready · 0 blocked")
+            Some("Work · 2 active · 0 needs input · 1 ready · 0 recent")
         );
     }
 
     #[test]
-    fn live_projection_hides_clean_transient_receipts_and_restores_todo_group() {
+    fn live_projection_hides_clean_transient_receipts_without_duplicate_todo_group() {
         let todo_id = WorkNodeId::derive("work-surface-test", "todo:1");
         let todo = WorkNode {
             id: todo_id.clone(),
@@ -900,13 +1221,7 @@ mod tests {
             plan_index: None,
         });
 
-        let rows = graph_rows(
-            &snapshot,
-            None,
-            "To-do",
-            "{label} {completed}/{total} · {remaining} left",
-            "Plan",
-        );
+        let rows = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default());
         let labels = rows
             .iter()
             .map(|row| row.label.as_str())
@@ -914,7 +1229,18 @@ mod tests {
 
         assert!(labels.contains(&"operation running"), "{labels:?}");
         assert!(!labels.contains(&"operation settled"), "{labels:?}");
-        assert!(labels.contains(&"To-do 0/1 · 1 left"), "{labels:?}");
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == "Keep the durable checklist visible")
+                .count(),
+            1,
+            "one plan node must produce one Work row: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.starts_with("To-do")),
+            "the ordered Work projection must not add a duplicate To-do heading: {labels:?}"
+        );
         assert!(
             labels.contains(&"Keep the durable checklist visible"),
             "{labels:?}"
@@ -940,13 +1266,7 @@ mod tests {
         let mut snapshot = WorkGraphSnapshot::new();
         snapshot.nodes = vec![durable, failed, evidence_pending];
 
-        let rows = graph_rows(
-            &snapshot,
-            None,
-            "To-do",
-            "{label} {completed}/{total} · {remaining} left",
-            "Plan",
-        );
+        let rows = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default());
         let labels = rows
             .iter()
             .map(|row| row.label.as_str())
@@ -959,5 +1279,49 @@ mod tests {
         ] {
             assert!(labels.contains(&expected), "missing {expected}: {labels:?}");
         }
+    }
+
+    #[test]
+    fn projection_orders_attention_before_ready_and_recent() {
+        let mut recent = operation(NodeState::Completed, "recent");
+        recent.binding.as_mut().expect("binding").durable = true;
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![
+            recent,
+            operation(NodeState::Ready, "ready"),
+            operation(NodeState::Blocked, "blocked"),
+            operation(NodeState::Active, "active"),
+        ];
+
+        let labels = graph_rows(&snapshot, None, Vec::new(), SettledFileActivity::default())
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            [
+                "Work · 1 active · 1 needs input · 1 ready · 1 recent",
+                "operation active",
+                "operation blocked",
+                "operation ready",
+                "operation recent",
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_targets_keep_workspace_relative_paths_and_hide_external_paths() {
+        let workspace = Path::new("/workspace/project");
+        assert_eq!(
+            privacy_safe_path(workspace, "/workspace/project/src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            privacy_safe_path(workspace, "/Users/alice/private.txt"),
+            None
+        );
+        assert_eq!(privacy_safe_path(workspace, "../private.txt"), None);
+        assert_eq!(safe_pattern("needle\nsecret"), "needle secret");
     }
 }

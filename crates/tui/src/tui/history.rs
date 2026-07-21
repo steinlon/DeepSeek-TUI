@@ -2366,8 +2366,10 @@ impl FileActivitySummary {
         match name {
             "read_file" | "Read" | "read" => Some(FileActivityKind::Read),
             "list_dir" | "list_directory" | "Glob" | "glob" => Some(FileActivityKind::List),
-            "search" | "grep" | "Grep" | "codebase_search" => Some(FileActivityKind::Search),
-            "write_file" | "Write" | "apply_patch" | "Edit" | "edit_file" => {
+            "search" | "grep" | "Grep" | "grep_files" | "file_search" | "codebase_search" => {
+                Some(FileActivityKind::Search)
+            }
+            "write_file" | "Write" | "apply_patch" | "Edit" | "edit_file" | "fim_edit" => {
                 Some(FileActivityKind::Write)
             }
             _ => None,

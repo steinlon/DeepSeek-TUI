@@ -510,6 +510,11 @@ pub struct ProviderPickerMemory {
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
     pub spawn_depth: u32,
+    /// Last tool observed running for this child. Cleared by the matching
+    /// completion envelope so Work never presents a settled tool as live.
+    pub current_tool: Option<String>,
+    /// Successful file mutations observed for this child in this session.
+    pub files_touched: u32,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).

@@ -197,6 +197,7 @@ pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) 
                 .or_insert_with(|| AgentProgressMeta {
                     parent_run_id: agent.parent_run_id.clone(),
                     spawn_depth: agent.spawn_depth,
+                    ..AgentProgressMeta::default()
                 });
         }
     }
@@ -386,6 +387,7 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
     // is special — it always belongs to the active fanout card if one
     // exists; otherwise it seeds a new one.
     let agent_id = message.agent_id().to_string();
+    record_agent_tool_activity(app, message);
     if subagent_message_refreshes_workspace_context(message) {
         workspace_context::refresh_now(app, Instant::now());
     }
@@ -472,6 +474,42 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
         app.bump_history_cell(idx);
         true
     }
+}
+
+fn record_agent_tool_activity(app: &mut App, message: &MailboxMessage) {
+    let (agent_id, tool_name, completed_ok) = match message {
+        MailboxMessage::ToolCallStarted {
+            agent_id,
+            tool_name,
+            ..
+        } => (agent_id, tool_name, None),
+        MailboxMessage::ToolCallCompleted {
+            agent_id,
+            tool_name,
+            ok,
+            ..
+        } => (agent_id, tool_name, Some(*ok)),
+        _ => return,
+    };
+    let meta = app.agent_progress_meta.entry(agent_id.clone()).or_default();
+    match completed_ok {
+        None => meta.current_tool = Some(tool_name.clone()),
+        Some(ok) => {
+            if meta.current_tool.as_deref() == Some(tool_name.as_str()) {
+                meta.current_tool = None;
+            }
+            if ok && is_file_mutation_tool(tool_name) {
+                meta.files_touched = meta.files_touched.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn is_file_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "apply_patch" | "fim_edit" | "Write" | "Edit"
+    )
 }
 
 pub(super) fn task_mode_label(mode: AppMode) -> &'static str {
@@ -820,6 +858,30 @@ mod tests {
             handle_subagent_mailbox(&mut app, 3, &tool),
             "tool progress still updates the visible transcript card"
         );
+        assert_eq!(
+            app.agent_progress_meta["agent_live"]
+                .current_tool
+                .as_deref(),
+            Some("read_file")
+        );
+
+        let completed = MailboxMessage::ToolCallCompleted {
+            agent_id: "agent_live".to_string(),
+            tool_name: "read_file".to_string(),
+            step: 1,
+            ok: true,
+        };
+        assert!(handle_subagent_mailbox(&mut app, 4, &completed));
+        assert_eq!(app.agent_progress_meta["agent_live"].current_tool, None);
+
+        let wrote = MailboxMessage::ToolCallCompleted {
+            agent_id: "agent_live".to_string(),
+            tool_name: "apply_patch".to_string(),
+            step: 2,
+            ok: true,
+        };
+        assert!(handle_subagent_mailbox(&mut app, 5, &wrote));
+        assert_eq!(app.agent_progress_meta["agent_live"].files_touched, 1);
     }
 
     #[test]
@@ -836,6 +898,7 @@ mod tests {
             AgentProgressMeta {
                 parent_run_id: None,
                 spawn_depth: 0,
+                ..AgentProgressMeta::default()
             },
         );
 
@@ -850,6 +913,7 @@ mod tests {
             AgentProgressMeta {
                 parent_run_id: None,
                 spawn_depth: 0,
+                ..AgentProgressMeta::default()
             },
         );
 
@@ -900,6 +964,7 @@ mod tests {
             AgentProgressMeta {
                 parent_run_id: None,
                 spawn_depth: 0,
+                ..AgentProgressMeta::default()
             },
         );
 

@@ -22,8 +22,12 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::config::Config;
+    use crate::tools::subagent::{
+        AgentWorkerStatus, SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType,
+    };
     use crate::tools::todo::TodoStatus;
-    use crate::tui::app::{App, SidebarRowAction, TuiOptions};
+    use crate::tui::app::{App, SidebarRowAction, ToolDetailRecord, TuiOptions};
+    use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
     use crate::work_graph::{
         AcceptanceRequirement, ChangeCtx, EdgeKind, EvidenceKindTag, NodeKind, NodeState,
         OperationBinding, OperationOwnerSnapshot, OwnerState, Provenance, WorkEdge, WorkEdgeId,
@@ -198,8 +202,11 @@ mod tests {
 
         let rows = super::model::project(&mut app);
 
-        assert!(rows[0].label.starts_with("Work · 1 running · 3 ready"));
-        assert_eq!(rows[1].label, "To-do 0/4 · 4 left");
+        assert!(
+            rows[0]
+                .label
+                .starts_with("Work · 1 active · 0 needs input · 3 ready")
+        );
         for index in 0..4 {
             assert!(
                 rows.iter()
@@ -210,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_heading_reports_completed_total_and_remaining() {
+    fn todos_share_one_ordered_work_projection_without_a_second_heading() {
         let mut app = app();
         {
             let mut todos = app.todos.try_lock().expect("todos");
@@ -221,7 +228,141 @@ mod tests {
 
         let rows = super::model::project(&mut app);
 
-        assert_eq!(rows[1].label, "To-do 1/3 · 2 left");
+        assert_eq!(
+            rows[0].label,
+            "Work · 1 active · 0 needs input · 1 ready · 1 recent"
+        );
+        assert_eq!(
+            rows.iter()
+                .skip(1)
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["current", "next", "finished"]
+        );
+    }
+
+    #[test]
+    fn settled_file_tools_aggregate_once_and_keep_only_safe_targets() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.workspace = PathBuf::from("/workspace/project");
+        for (id, name, input, status) in [
+            (
+                "read-1",
+                "read_file",
+                serde_json::json!({"path": "/workspace/project/src/lib.rs"}),
+                ToolStatus::Success,
+            ),
+            (
+                "search-1",
+                "grep_files",
+                serde_json::json!({"pattern": "WorkSurfaceState"}),
+                ToolStatus::Success,
+            ),
+            (
+                "write-1",
+                "edit_file",
+                serde_json::json!({"path": "src/lib.rs"}),
+                ToolStatus::Success,
+            ),
+            (
+                "read-external",
+                "read_file",
+                serde_json::json!({"path": "/Users/alice/private.txt"}),
+                ToolStatus::Failed,
+            ),
+        ] {
+            app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: name.to_string(),
+                status,
+                input_summary: None,
+                output: Some("done".to_string()),
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })));
+            let index = app.history.len() - 1;
+            app.tool_details_by_cell.insert(
+                index,
+                ToolDetailRecord {
+                    tool_id: id.to_string(),
+                    tool_name: name.to_string(),
+                    input,
+                    output: Some("done".to_string()),
+                },
+            );
+        }
+
+        let rows = super::model::project(&mut app);
+        let labels = rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"Read 1 files"), "{labels:?}");
+        assert!(labels.contains(&"Searched 1 patterns"), "{labels:?}");
+        assert!(labels.contains(&"Wrote 1 files"), "{labels:?}");
+        assert!(!rows.iter().any(|row| row.detail.contains("/Users/alice")));
+        let read = rows
+            .iter()
+            .find(|row| row.label == "Read 1 files")
+            .expect("read activity row");
+        assert_eq!(read.detail, "src/lib.rs");
+    }
+
+    #[test]
+    fn agent_rows_show_role_assignment_and_open_real_agent_details() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.subagent_cache.push(SubAgentResult {
+            name: "agent_worker".to_string(),
+            agent_id: "agent_worker".to_string(),
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            workspace: None,
+            git_branch: None,
+            agent_type: SubAgentType::Implementer,
+            assignment: SubAgentAssignment {
+                objective: "Wire settled file activity".to_string(),
+                role: Some("worker".to_string()),
+            },
+            model: "test-model".to_string(),
+            nickname: Some("Blue Whale".to_string()),
+            status: SubAgentStatus::Running,
+            worker_status: Some(AgentWorkerStatus::RunningTool),
+            parent_run_id: None,
+            spawn_depth: 1,
+            result: None,
+            steps_taken: 2,
+            checkpoint: None,
+            needs_input: None,
+            duration_ms: 50,
+            from_prior_session: false,
+        });
+        app.agent_progress_meta.insert(
+            "agent_worker".to_string(),
+            crate::tui::app::AgentProgressMeta {
+                current_tool: Some("apply_patch".to_string()),
+                files_touched: 2,
+                ..crate::tui::app::AgentProgressMeta::default()
+            },
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_worker")
+            .expect("agent work row");
+        assert_eq!(row.label, "Agent Blue Whale · worker");
+        assert!(row.detail.contains("Wire settled file activity"));
+        assert!(row.detail.contains("using apply_patch"));
+        assert!(row.detail.contains("2 files changed"));
+        assert_eq!(
+            row.primary_action,
+            Some(SidebarRowAction::OpenAgentDetail {
+                agent_id: "agent_worker".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -293,7 +434,7 @@ mod tests {
         assert!(
             rows[0]
                 .label
-                .starts_with("Work · 0 running · 1 waiting · 0 ready · 0 blocked"),
+                .starts_with("Work · 0 active · 1 needs input · 0 ready · 0 recent"),
             "{}",
             rows[0].label
         );
@@ -306,7 +447,7 @@ mod tests {
         restore_graph(&mut app, &graph);
 
         let rows = super::model::project(&mut app);
-        assert!(rows[0].label.contains("1 blocked"), "{}", rows[0].label);
+        assert!(rows[0].label.contains("1 needs input"), "{}", rows[0].label);
         let row = rows.iter().find(|row| row.selectable).expect("stale row");
         assert_eq!(row.mark, "?");
         assert!(row.detail.starts_with("stale · operation"));
@@ -355,7 +496,7 @@ mod tests {
         restore_graph(&mut app, &graph);
 
         let rows = super::model::project(&mut app);
-        assert!(rows[0].label.contains("1 blocked"), "{}", rows[0].label);
+        assert!(rows[0].label.contains("1 needs input"), "{}", rows[0].label);
         let row = rows
             .iter()
             .find(|row| row.selectable)

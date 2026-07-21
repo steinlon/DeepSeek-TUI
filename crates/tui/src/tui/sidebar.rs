@@ -5878,6 +5878,7 @@ mod tests {
             AgentProgressMeta {
                 parent_run_id: None,
                 spawn_depth: 1,
+                ..AgentProgressMeta::default()
             },
         );
         app.agent_progress.insert(
@@ -5889,6 +5890,7 @@ mod tests {
             AgentProgressMeta {
                 parent_run_id: Some("agent_parent".to_string()),
                 spawn_depth: 2,
+                ..AgentProgressMeta::default()
             },
         );
         app.ensure_agent_label("agent_parent");

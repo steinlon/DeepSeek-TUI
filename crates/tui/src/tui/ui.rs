@@ -3604,13 +3604,9 @@ async fn run_event_loop(
                         );
                         app.agent_progress
                             .insert(id.clone(), format!("starting: {prompt_summary}"));
-                        app.agent_progress_meta.insert(
-                            id.clone(),
-                            crate::tui::app::AgentProgressMeta {
-                                parent_run_id,
-                                spawn_depth,
-                            },
-                        );
+                        let meta = app.agent_progress_meta.entry(id.clone()).or_default();
+                        meta.parent_run_id = parent_run_id;
+                        meta.spawn_depth = spawn_depth;
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
@@ -3634,13 +3630,9 @@ async fn run_event_loop(
                         } else {
                             app.agent_progress.insert(id.clone(), display.clone());
                         }
-                        app.agent_progress_meta.insert(
-                            id.clone(),
-                            crate::tui::app::AgentProgressMeta {
-                                parent_run_id,
-                                spawn_depth,
-                            },
-                        );
+                        let meta = app.agent_progress_meta.entry(id.clone()).or_default();
+                        meta.parent_run_id = parent_run_id;
+                        meta.spawn_depth = spawn_depth;
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
