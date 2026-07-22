@@ -775,6 +775,51 @@ pub(super) fn api_url_with_suffix(base_url: &str, path: &str, path_suffix: Optio
     format!("{}/{}", versioned.trim_end_matches('/'), path)
 }
 
+/// Route strict DeepSeek tool requests through the beta Chat Completions
+/// surface while keeping every ordinary request on the canonical `/v1` path.
+///
+/// DeepSeek requires its `/beta` base URL when a function opts into
+/// `strict: true`. The configured route URL remains semantic here because
+/// unit tests may replace only the transport origin with a local capture
+/// server.
+///
+/// Source: <https://api-docs.deepseek.com/guides/tool_calls/> (verified 2026-07-22).
+fn chat_completions_url(
+    transport_base_url: &str,
+    route_base_url: &str,
+    provider: ApiProvider,
+    path_suffix: Option<&str>,
+    body: &Value,
+) -> String {
+    let uses_deepseek_beta = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        && is_official_deepseek_beta_base_url(route_base_url)
+        && body_uses_strict_tools(body)
+        && path_suffix.is_none();
+    let path = if uses_deepseek_beta {
+        "beta/chat/completions"
+    } else {
+        "chat/completions"
+    };
+    api_url_with_suffix(transport_base_url, path, path_suffix)
+}
+
+fn is_official_deepseek_beta_base_url(base_url: &str) -> bool {
+    matches!(
+        base_url.trim_end_matches('/').to_ascii_lowercase().as_str(),
+        "https://api.deepseek.com/beta" | "https://api.deepseeki.com/beta"
+    )
+}
+
+fn body_uses_strict_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.pointer("/function/strict").and_then(Value::as_bool) == Some(true))
+        })
+}
+
 fn normalize_audio_format(format: &str) -> String {
     let normalized = format.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -2978,6 +3023,136 @@ mod tests {
         client
     }
 
+    fn deepseek_request_boundary_client(
+        route_base_url: &str,
+        transport_base_url: String,
+    ) -> DeepSeekClient {
+        let mut client = DeepSeekClient::new(&Config {
+            provider: Some("deepseek".to_string()),
+            api_key: Some("deepseek-request-boundary-key".to_string()),
+            base_url: Some(route_base_url.to_string()),
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            ..Config::default()
+        })
+        .expect("DeepSeek request-boundary client");
+        client.test_chat_transport_base_url = Some(transport_base_url);
+        client
+    }
+
+    async fn capture_deepseek_chat_request(
+        route_base_url: &str,
+        strict: bool,
+        streaming: bool,
+    ) -> (String, Value) {
+        let server = MockServer::start().await;
+        let response = if streaming {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n")
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-deepseek-request-boundary",
+                "object": "chat.completion",
+                "model": "deepseek-v4-pro",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }))
+        };
+        Mock::given(method("POST"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut tool = test_tool("lookup");
+        if !strict {
+            tool.strict = None;
+        }
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "provider-free DeepSeek route fixture".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: 64,
+            system: None,
+            tools: Some(vec![tool]),
+            tool_choice: Some(json!(if strict { "required" } else { "auto" })),
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("off".to_string()),
+            stream: Some(streaming),
+            temperature: None,
+            top_p: None,
+        };
+        let client = deepseek_request_boundary_client(route_base_url, server.uri());
+
+        if streaming {
+            let mut stream = client
+                .create_message_stream(request)
+                .await
+                .expect("streaming request succeeds");
+            while let Some(event) = stream.next().await {
+                event.expect("captured SSE response remains valid");
+            }
+        } else {
+            client
+                .create_message(request)
+                .await
+                .expect("non-streaming request succeeds");
+        }
+
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        let path = requests[0].url.path().to_string();
+        let body = serde_json::from_slice(&requests[0].body).expect("captured request JSON");
+        (path, body)
+    }
+
+    async fn assert_deepseek_strict_request_route_boundary(streaming: bool) {
+        for (route_base_url, strict, expected_path, expected_wire_strict) in [
+            (
+                "https://api.deepseek.com/beta",
+                false,
+                "/v1/chat/completions",
+                None,
+            ),
+            (
+                "https://api.deepseek.com/beta",
+                true,
+                "/beta/chat/completions",
+                Some(true),
+            ),
+            (
+                "https://api.deepseek.com/v1",
+                true,
+                "/v1/chat/completions",
+                None,
+            ),
+        ] {
+            let (captured_path, body) =
+                capture_deepseek_chat_request(route_base_url, strict, streaming).await;
+            assert_eq!(captured_path, expected_path, "{route_base_url} {body}");
+            assert_eq!(
+                body.pointer("/tools/0/function/strict")
+                    .and_then(Value::as_bool),
+                expected_wire_strict,
+                "{route_base_url} {body}"
+            );
+        }
+    }
+
     fn k3_request_fixture(model: &str, effort: Option<&str>, stream: bool) -> MessageRequest {
         MessageRequest {
             model: model.to_string(),
@@ -3443,6 +3618,16 @@ mod tests {
     #[tokio::test]
     async fn create_message_stream_request_json_honors_exact_k3_route_boundaries() {
         assert_k3_request_json_route_boundaries(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_routes_only_strict_deepseek_tools_to_beta() {
+        assert_deepseek_strict_request_route_boundary(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_routes_only_strict_deepseek_tools_to_beta() {
+        assert_deepseek_strict_request_route_boundary(true).await;
     }
 
     #[tokio::test]

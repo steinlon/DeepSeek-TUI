@@ -76,9 +76,9 @@ use crate::models::{
 
 use super::{
     DeepSeekClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
-    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer, api_url_with_suffix,
-    apply_reasoning_effort, bounded_error_text, from_api_tool_name, parse_usage,
-    release_stream_buffer, system_to_instructions, to_api_tool_name,
+    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer,
+    apply_reasoning_effort, bounded_error_text, chat_completions_url, from_api_tool_name,
+    parse_usage, release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
 
 fn apply_provider_token_limit(
@@ -463,10 +463,12 @@ impl DeepSeekClient {
             None
         };
 
-        let url = api_url_with_suffix(
+        let url = chat_completions_url(
             self.chat_transport_base_url(),
-            "chat/completions",
+            &self.base_url,
+            self.api_provider,
             self.path_suffix.as_deref(),
+            &body,
         );
         let open_timeout = stream_open_timeout();
         let response = match tokio_timeout(open_timeout, self.send_json_with_retry(&url, &body))
@@ -619,10 +621,12 @@ impl DeepSeekClient {
         );
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
-        let url = api_url_with_suffix(
+        let url = chat_completions_url(
             self.chat_transport_base_url(),
-            "chat/completions",
+            &self.base_url,
+            self.api_provider,
             self.path_suffix.as_deref(),
+            &body,
         );
         let response = self.send_json_with_retry(&url, &body).await?;
 
